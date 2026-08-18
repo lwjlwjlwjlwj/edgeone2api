@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  edgeone2api:
+    build: .
+    container_name: edgeone2api
+    ports:
+      - "7863:7863"
+    environment:
+      - EDGEONE_API_LISTEN=:7863
+      - EDGEONE_API_KEY=your-api-key-here
+      - EDGEONE_API_MODELS=@makers/deepseek-v4-flash,@makers/deepseek-v4-pro
+      - EDGEONE_API_POOL_MIN=2
+      - EDGEONE_API_POOL_MAX=8
+      - EDGEONE_API_TTL_MINUTES=30
+      - EDGEONE_API_UPSTREAM=https://deepseek-harness.edgeone.cool
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:7863/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
