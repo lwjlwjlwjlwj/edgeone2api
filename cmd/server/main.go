@@ -1,7 +1,6 @@
-﻿package main
+package main
 
 import (
-	"context"
 	"flag"
 	"log"
 	"net/http"
@@ -10,7 +9,6 @@ import (
 	"edgeone2api/internal/auth"
 	"edgeone2api/internal/config"
 	"edgeone2api/internal/server"
-	"edgeone2api/internal/toolcall"
 )
 
 func main() {
@@ -41,16 +39,7 @@ func main() {
 	time.Sleep(2 * time.Second)
 	log.Printf("session pool ready: %d session(s)", pool.Count())
 
-	// Start the tool-call sidecar (Python). Best-effort: if Python is
-	// unavailable, the server still runs without tool calling support.
-	tc := toolcall.NewClient()
-	if err := tc.Start(context.Background(), 30*time.Second); err != nil {
-		log.Printf("[toolcall] sidecar disabled: %v", err)
-	} else {
-		defer tc.Stop()
-	}
-
-	srv := server.New(pool, tc, cfg.APIKey, cfg.Models, 180*time.Second, cfg.ModelMap)
+	srv := server.New(pool, cfg.APIKey, cfg.Models, 180*time.Second, cfg.ModelMap)
 	httpServer := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           srv.Handler(),

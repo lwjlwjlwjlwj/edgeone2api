@@ -2,19 +2,20 @@
 
 > EdgeOne Makers Agent 的 OpenAI 兼容 API 网关，Go 实现。
 
-逆向自 EdgeOne Makers / DeepSeek Harness Web Chat 的 `session.prompt` RPC 接口，将其封装为标准 OpenAI 兼容 `/v1/chat/completions` 端点，支持 SSE 流式 + 工具调用（Tool Calling），免登录即可调用 Makers Agent 托管的 DeepSeek 系列模型。
+逆向自 EdgeOne Makers / DeepSeek Harness Web Chat 的 `session.prompt` RPC 接口，将其封装为标准 OpenAI 兼容 `/v1/chat/completions` 端点，支持 SSE 流式输出，免登录即可调用 Makers Agent 托管的 DeepSeek 系列模型。
 
 ## 功能特性
 
 - **免登录** — 直接调用 Harness 的 `session.create` / `session.prompt` RPC，无需登录即可使用
 - **多模型支持** — `@makers/deepseek-v4-flash`、`@makers/deepseek-v4-pro`、`@makers/kimi-k2.6`、`@makers/hy3`、`@makers/minimax-m3` 等（通过 `model_map` 配置）
 - **推理强度可调** — 支持 OpenAI 标准 `reasoning_effort` 参数（`off`/`high`/`max`）
-- **工具调用** — 支持 OpenAI 标准 `tools` 参数，通过 Python 侧车（sidecar）解析模型输出的 XYML 标记，自动转换为标准 `tool_calls` 响应，支持连续多轮工具调用
 - **浏览器指纹隔离** — 每个会话独立 UA/Sec-CH-UA 指纹，上游将每个会话视为独立浏览器，限流互不影响
 - **弹性凭证池** — 会话池自动创建/复用/维护，配额感知轮换（绕过单一会话的用量上限）
-- **SSE 流式** — 流式透传上游事件流；非流式自动聚合 `content` / `tool_calls`
+- **SSE 流式** — 流式透传上游事件流；非流式自动聚合 `content`
 - **可选鉴权** — 配置 `api_key` 后需 Bearer token 访问
 - **Go 单二进制** — 无外部依赖，`go build` 即得
+
+> 工具调用请配合 [ToolForge](https://github.com/lwjlwjlwjlwj/toolforge) 中间件使用。
 
 ## 快速开始
 
@@ -58,29 +59,6 @@ curl -N http://localhost:7863/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"@makers/deepseek-v4-flash","stream":true,"messages":[{"role":"user","content":"数到3"}]}'
-
-# 工具调用
-curl -s http://localhost:7863/v1/chat/completions \
-  -H "Authorization: Bearer your-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model":"@makers/deepseek-v4-flash",
-    "messages":[{"role":"user","content":"东京天气怎么样？"}],
-    "tools": [{
-      "type": "function",
-      "function": {
-        "name": "get_weather",
-        "description": "查询城市天气",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "city": {"type": "string", "description": "城市名"}
-          },
-          "required": ["city"]
-        }
-      }
-    }]
-  }'
 
 # 鉴权可省略（api_key 为空时）；会话池状态
 curl -s http://localhost:7863/pool
@@ -148,7 +126,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 ### `POST /v1/chat/completions`
 
 OpenAI 兼容。支持 `stream`（SSE）、`max_tokens`、`temperature`、`top_p`、`reasoning_effort`。
-支持 `tools` 参数（工具调用），通过 Python 侧车解析模型输出的 XYML 标记，自动转换为标准 `tool_calls` 响应格式。
+不支持 `tools` 参数，工具调用请配合 [ToolForge](https://github.com/lwjlwjlwjlwj/toolforge) 使用。
 
 ### `GET /v1/models`
 
@@ -161,20 +139,6 @@ OpenAI 兼容。支持 `stream`（SSE）、`max_tokens`、`temperature`、`top_p
 ### `GET /healthz`
 
 健康检查。
-
-## 工具调用（Tool Calling）
-
-edgeone2api 支持 OpenAI 标准 `tools` 参数，内部实现采用 **Python 侧车（sidecar）** 方案：
-
-1. 请求携带 `tools` 参数时，服务端在 system prompt 中注入 XYML 格式的工具指令
-2. 模型以 XYML 标记（`<|XYML|tool_calls>`）格式输出工具调用
-3. 流式模式下，服务端缓冲文本，流结束后调用 Python 侧车解析
-4. 非流式模式下，直接调用 Python 侧车解析
-5. 解析结果转换为标准 OpenAI `tool_calls` 响应格式
-
-支持连续多轮工具调用：客户端将 `tool_calls` 执行结果以 `role: "tool"` 回传，服务端自动保留历史上下文。
-
-> 侧车进程为 `internal/toolcall/server.py`（纯 Python 标准库，零第三方依赖），Go 服务启动时自动拉起。Python 不可用时降级为纯文本模式。
 
 ## 会话连续性
 
@@ -205,7 +169,7 @@ docker compose up -d --build
 ```
 
 - 端口映射 `7863:7863`，通过 `docker-compose.yml` 的 environment 配置
-- Dockerfile 多阶段构建，运行时镜像含 Python 3（用于工具调用侧车）
+- Dockerfile 多阶段构建，alpine 运行时无外部依赖
 
 ## 目录结构
 
@@ -216,11 +180,7 @@ edgeone2api/
 │   ├── auth/pool.go              # 会话池：创建/绑定/轮换/维护（核心）
 │   ├── config/config.go          # 配置加载 + model_map + env override
 │   ├── upstream/client.go        # Harness RPC 客户端 + 浏览器指纹 + SSE 读取
-│   ├── server/server.go          # OpenAI 兼容 handler + 流式/非流式 + 工具调用
-│   └── toolcall/                 # 工具调用 Python 侧车
-│       ├── client.go             # Go 进程管理器 + HTTP 客户端
-│       ├── server.py             # Python HTTP 服务（/health, /parse, /instructions）
-│       └── xyml/                 # XYML 解析包（7 个模块）
+│   └── server/server.go          # OpenAI 兼容 handler + 流式/非流式
 ├── config.example.json
 ├── Dockerfile
 ├── docker-compose.yml

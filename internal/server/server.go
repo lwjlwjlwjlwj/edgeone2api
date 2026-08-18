@@ -1,4 +1,4 @@
-﻿package server
+package server
 
 import (
 	"bytes"
@@ -14,23 +14,20 @@ import (
 
 	"edgeone2api/internal/auth"
 	"edgeone2api/internal/config"
-	"edgeone2api/internal/toolcall"
 	"edgeone2api/internal/upstream"
 )
 
 // Server is an OpenAI-compatible API server backed by DeepSeek Harness sessions
 type Server struct {
 	pool     *auth.Pool
-	tc       *toolcall.Client
 	apiKey   string
 	models   []string
 	timeout  time.Duration
 	modelMap map[string]config.ModelMapping
 }
 
-// New creates a new server.
-// tc is the tool-call sidecar client; nil means tool calling is disabled.
-func New(pool *auth.Pool, tc *toolcall.Client, apiKey string, models []string, timeout time.Duration, modelMap map[string]config.ModelMapping) *Server {
+// New creates a new server
+func New(pool *auth.Pool, apiKey string, models []string, timeout time.Duration, modelMap map[string]config.ModelMapping) *Server {
 	if len(models) == 0 {
 		models = []string{"@makers/deepseek-v4-flash", "@makers/deepseek-v4-pro"}
 	}
@@ -39,7 +36,6 @@ func New(pool *auth.Pool, tc *toolcall.Client, apiKey string, models []string, t
 	}
 	return &Server{
 		pool:     pool,
-		tc:       tc,
 		apiKey:   apiKey,
 		models:   models,
 		timeout:  timeout,
@@ -82,20 +78,17 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 // --- Request types ---
 
 type openaiChatRequest struct {
-	Model           string              `json:"model"`
-	Messages        []openaiMessage     `json:"messages"`
-	Stream          bool                `json:"stream"`
-	MaxTokens       int                 `json:"max_tokens"`
-	Temperature     float64             `json:"temperature"`
-	ReasoningEffort string              `json:"reasoning_effort"`
-	Tools           json.RawMessage     `json:"tools,omitempty"`
+	Model           string          `json:"model"`
+	Messages        []openaiMessage `json:"messages"`
+	Stream          bool            `json:"stream"`
+	MaxTokens       int             `json:"max_tokens"`
+	Temperature     float64         `json:"temperature"`
+	ReasoningEffort string          `json:"reasoning_effort"`
 }
 
 type openaiMessage struct {
-	Role       string          `json:"role"`
-	Content    json.RawMessage `json:"content"`
-	ToolCalls  json.RawMessage `json:"tool_calls,omitempty"`
-	ToolCallID string          `json:"tool_call_id,omitempty"`
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
 }
 
 // --- Chat Completions ---
@@ -131,25 +124,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		model = s.models[0]
 	}
 
-	log.Printf("[CHAT] model=%s stream=%v msgs=%d tools=%v", model, req.Stream, len(req.Messages), req.Tools != nil)
+	log.Printf("[CHAT] model=%s stream=%v msgs=%d", model, req.Stream, len(req.Messages))
 
-	// Build XYML instructions if tools are provided and sidecar is available
-	var toolsJSON []byte
 	items := convertMessages(req.Messages)
-	if hasTools(req.Tools) && s.tc != nil && s.tc.IsRunning() {
-		toolsJSON, _ = json.Marshal(req.Tools)
-		instructions, err := s.tc.BuildInstructions(r.Context(), toolsJSON)
-		if err != nil {
-			log.Printf("[TOOLCALL] build instructions: %v", err)
-		} else if instructions != "" {
-			// Inject XYML instructions right after the system directive
-			injected := []upstream.ContentItem{
-				{Type: "text", Text: "[Tools]\n" + instructions + "\n---\n"},
-			}
-			items = append(injected, items...)
-			log.Printf("[TOOLCALL] injected XYML instructions (%d bytes)", len(instructions))
-		}
-	}
 
 	// Session affinity: every request gets a session key for continuity.
 	sessionKey := r.Header.Get("X-Session-Key")
@@ -193,13 +170,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	created := time.Now().Unix()
 
 	if req.Stream {
-		s.streamChat(w, ctx, session, chatID, model, created, items, sessionKey, toolsJSON)
+		s.streamChat(w, ctx, session, chatID, model, created, items, sessionKey)
 	} else {
-		s.nonStreamChat(w, ctx, session, chatID, model, created, items, sessionKey, toolsJSON)
+		s.nonStreamChat(w, ctx, session, chatID, model, created, items, sessionKey)
 	}
 }
 
-func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, items []upstream.ContentItem, sessionKey string, toolsJSON []byte) {
+func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, items []upstream.ContentItem, sessionKey string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		s.pool.ReleaseBind(sessionKey, session, false)
@@ -240,9 +217,6 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 		flusher.Flush()
 
 		success := false
-		finished := false
-		useToolParsing := len(toolsJSON) > 0 && s.tc != nil && s.tc.IsRunning()
-		var textBuf strings.Builder
 
 		defer func() {
 			s.pool.ReleaseBind(sessionKey, session, success)
@@ -250,53 +224,11 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 
 		_, streamErr := session.Client.StreamEvents(ctx, cs, func(chunk upstream.AssistantChunk) {
 			if chunk.IsDone {
-				// If tool parsing is enabled, buffer is complete — parse now
-				if useToolParsing && textBuf.Len() > 0 {
-					tcCalls, tcErr := s.tc.ParseToolCalls(ctx, textBuf.String(), toolsJSON)
-					if tcErr == nil && len(tcCalls) > 0 {
-						// Emit tool calls
-						emitSSE(w, chatID, model, created, map[string]any{
-							"content":    nil,
-							"tool_calls": tcCalls,
-						})
-						flusher.Flush()
-						emitFinish(w, chatID, model, created, "tool_calls")
-						flusher.Flush()
-						finished = true
-						return
-					}
-					// No tool calls found — fall through to emit buffered text as content
-				}
-				// De-dupe: if we already emitted text via deltas, tool_calls block
-				// handles finish. If no tool parsing, just emit the finish.
-				if !useToolParsing || textBuf.Len() == 0 {
-					emitFinish(w, chatID, model, created, "stop")
-					flusher.Flush()
-				} else {
-					// We buffered text but no tool calls found — emit the buffer
-					emitSSE(w, chatID, model, created, map[string]any{"content": textBuf.String()})
-					flusher.Flush()
-					emitFinish(w, chatID, model, created, "stop")
-					flusher.Flush()
-				}
-				finished = true
+				emitFinish(w, chatID, model, created, "stop")
+				flusher.Flush()
 				return
 			}
 
-			if useToolParsing {
-				// Buffer text for later parsing
-				if chunk.Text != "" {
-					textBuf.WriteString(chunk.Text)
-				}
-				// Still emit reasoning in real-time
-				if chunk.Reasoning != "" {
-					emitSSE(w, chatID, model, created, map[string]any{"reasoning_content": chunk.Reasoning})
-					flusher.Flush()
-				}
-				return
-			}
-
-			// No tool parsing — stream as before
 			delta := map[string]any{}
 			if chunk.Text != "" {
 				delta["content"] = chunk.Text
@@ -316,10 +248,8 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 			success = true
 		}
 
-		if !finished {
-			emitFinish(w, chatID, model, created, "stop")
-			flusher.Flush()
-		}
+		emitFinish(w, chatID, model, created, "stop")
+		flusher.Flush()
 		return
 	}
 	// Both attempts failed
@@ -327,7 +257,7 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 	writeJSON(w, http.StatusBadGateway, map[string]any{"error": "upstream quota exceeded, retry later"})
 }
 
-func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, items []upstream.ContentItem, sessionKey string, toolsJSON []byte) {
+func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, items []upstream.ContentItem, sessionKey string) {
 	var result upstream.ChatResult
 	var err error
 
@@ -364,15 +294,6 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 	success := true
 
 	msg := map[string]any{"role": "assistant", "content": result.Text}
-
-	// If tools are present, try to parse tool calls from the response text
-	if len(toolsJSON) > 0 && s.tc != nil && s.tc.IsRunning() && result.Text != "" {
-		tcCalls, tcErr := s.tc.ParseToolCalls(ctx, result.Text, toolsJSON)
-		if tcErr == nil && len(tcCalls) > 0 {
-			msg["content"] = nil
-			msg["tool_calls"] = tcCalls
-		}
-	}
 
 	resp := map[string]any{
 		"id":      chatID,
@@ -419,43 +340,12 @@ func convertMessages(msgs []openaiMessage) []upstream.ContentItem {
 			}
 		case "assistant":
 			text := extractContent(msg.Content)
-
-			// Append tool_calls as text if present
-			if msg.ToolCalls != nil {
-				var tcs []struct {
-					ID       string `json:"id"`
-					Function struct {
-						Name      string `json:"name"`
-						Arguments string `json:"arguments"`
-					} `json:"function"`
-				}
-				if err := json.Unmarshal(msg.ToolCalls, &tcs); err == nil && len(tcs) > 0 {
-					if text != "" && !strings.HasSuffix(text, "\n") {
-						text += "\n"
-					}
-					text += "[Tool calls: "
-					for i, tc := range tcs {
-						if i > 0 {
-							text += "; "
-						}
-						text += tc.Function.Name + "(" + tc.Function.Arguments + ")"
-					}
-					text += "]"
-				}
-			}
-
 			if text != "" {
 				items = append(items, upstream.ContentItem{Type: "text", Text: text})
 			}
 		case "tool":
-			text := extractContent(msg.Content)
-			if text != "" {
-				toolCallID := msg.ToolCallID
-				if toolCallID == "" {
-					toolCallID = "unknown"
-				}
-				items = append(items, upstream.ContentItem{Type: "text", Text: "[Tool result (" + toolCallID + "): " + text + "]"})
-			}
+			// Tool calls are not supported; skip tool role messages
+			continue
 		}
 	}
 	return items
@@ -524,11 +414,7 @@ func emitFinish(w http.ResponseWriter, chatID, model string, created int64, fini
 // --- Health / Pool ---
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	tti := "toolcall down"
-	if s.tc != nil && s.tc.IsRunning() {
-		tti = "toolcall ok"
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "poolSize": s.pool.Count(), "toolcall": tti})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "poolSize": s.pool.Count()})
 }
 
 func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
@@ -549,18 +435,4 @@ func randHex(n int) string {
 		b = []byte(time.Now().String())
 	}
 	return hex.EncodeToString(b)[:n]
-}
-
-// hasTools reports whether a raw JSON `tools` payload contains real tool
-// definitions (guards against explicit null/empty arrays).
-func hasTools(raw json.RawMessage) bool {
-	trimmed := strings.TrimSpace(string(raw))
-	if trimmed == "" || trimmed == "null" {
-		return false
-	}
-	var arr []json.RawMessage
-	if err := json.Unmarshal(raw, &arr); err != nil || len(arr) == 0 {
-		return false
-	}
-	return true
 }
