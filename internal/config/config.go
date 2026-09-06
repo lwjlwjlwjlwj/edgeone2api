@@ -50,7 +50,7 @@ func defaultConfig() Config {
 		Models:           []string{"@makers/deepseek-v4-flash", "@makers/deepseek-v4-pro"},
 		PoolMin:          4,
 		PoolMax:          32,
-		TTLMin:           60,
+		TTLMin:           0, // 0 = 无生命周期限制，会话仅在调用失败或达 max_req_per_session 时回收
 		BindTTLMin:       30,
 		MaxReqPerSession: 200,
 		UpstreamURL:      "https://deepseek-harness.edgeone.cool",

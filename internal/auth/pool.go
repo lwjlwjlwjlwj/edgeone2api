@@ -116,9 +116,8 @@ func NewPool(cfg PoolConfig) *Pool {
 	if cfg.BindTTL == 0 {
 		cfg.BindTTL = 30 * time.Minute
 	}
-	if cfg.TTL == 0 {
-		cfg.TTL = 60 * time.Minute
-	}
+	// TTL 0 means no max lifetime — sessions are only recycled on failure
+	// (FailedCount >= 3) or when MaxReqPerSession is exceeded.
 	if cfg.MaxReqPerSession == 0 {
 		cfg.MaxReqPerSession = 200
 	}
@@ -245,7 +244,7 @@ func (p *Pool) Acquire(ctx context.Context) (*Session, error) {
 		p.mu.Lock()
 		now := time.Now()
 		for _, s := range p.free {
-			if now.Sub(s.CreatedAt) > p.config.TTL {
+			if p.config.TTL > 0 && now.Sub(s.CreatedAt) > p.config.TTL {
 				continue // expired
 			}
 			if s.mu.TryLock() {
@@ -310,7 +309,7 @@ func (p *Pool) Bind(ctx context.Context, key string) (*Session, error) {
 		// Need a session for this key: reuse a free one or create new
 		now := time.Now()
 		for i, s := range p.free {
-			if now.Sub(s.CreatedAt) > p.config.TTL {
+			if p.config.TTL > 0 && now.Sub(s.CreatedAt) > p.config.TTL {
 				continue
 			}
 			if s.mu.TryLock() {
@@ -609,7 +608,7 @@ func (p *Pool) maintain() {
 		// Drop expired free sessions
 		kept := make([]*Session, 0, len(p.free))
 		for _, s := range p.free {
-			if now.Sub(s.CreatedAt) > p.config.TTL {
+			if p.config.TTL > 0 && now.Sub(s.CreatedAt) > p.config.TTL {
 				continue
 			}
 			kept = append(kept, s)
@@ -618,7 +617,7 @@ func (p *Pool) maintain() {
 
 		// Reap idle bound sessions
 		for k, be := range p.binds {
-			if now.Sub(be.lastUsed) > p.config.BindTTL || now.Sub(be.session.CreatedAt) > p.config.TTL {
+			if now.Sub(be.lastUsed) > p.config.BindTTL || (p.config.TTL > 0 && now.Sub(be.session.CreatedAt) > p.config.TTL) {
 				if be.session.mu.TryLock() {
 					delete(p.binds, k)
 					be.session.bound = false
@@ -632,7 +631,7 @@ func (p *Pool) maintain() {
 		// Count genuinely available free sessions (not expired, not busy).
 		freeAvail := 0
 		for _, s := range p.free {
-			if now.Sub(s.CreatedAt) > p.config.TTL {
+			if p.config.TTL > 0 && now.Sub(s.CreatedAt) > p.config.TTL {
 				continue
 			}
 			if s.mu.TryLock() {

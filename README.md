@@ -73,7 +73,7 @@ curl -s http://localhost:7863/pool
   "models": ["@makers/deepseek-v4-flash", "@makers/deepseek-v4-pro"],
   "pool_min": 4,
   "pool_max": 32,
-  "ttl_minutes": 60,
+  "ttl_minutes": 0,
   "bind_ttl_minutes": 30,
   "max_req_per_session": 200,
   "upstream_url": "https://deepseek-harness.edgeone.cool",
@@ -91,7 +91,7 @@ curl -s http://localhost:7863/pool
 | `models` | `EDGEONE_API_MODELS` | `[flash, pro]` | 支持的模型列表（`/v1/models` 返回） |
 | `pool_min` | `EDGEONE_API_POOL_MIN` | `4` | 会话池最小会话数 |
 | `pool_max` | `EDGEONE_API_POOL_MAX` | `32` | 会话池最大会话数（并发上限） |
-| `ttl_minutes` | `EDGEONE_API_TTL_MINUTES` | `60` | 会话最长生命周期（分钟） |
+| `ttl_minutes` | `EDGEONE_API_TTL_MINUTES` | `0` | 会话最长生命周期（分钟，`0`=无限制，仅失败或达上限时回收） |
 | `bind_ttl_minutes` | `EDGEONE_API_BIND_TTL_MINUTES` | `30` | 绑定会话（会话连续性）空闲超时（分钟） |
 | `max_req_per_session` | `EDGEONE_API_MAX_REQ_PER_SESSION` | `200` | 单会话最大请求数，超出后自动轮换 |
 | `upstream_url` | `EDGEONE_API_UPSTREAM` | `https://deepseek-harness.edgeone.cool` | 上游 Harness 地址 |
