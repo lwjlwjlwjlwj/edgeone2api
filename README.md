@@ -36,7 +36,7 @@ cp config.example.json config.json
 或直接用环境变量（无需配置文件）：
 
 ```bash
-EDGEONE_API_LISTEN=:7863 EDGEONE_API_POOL_MIN=2 EDGEONE_API_POOL_MAX=8 ./edgeone2api
+EDGEONE_API_LISTEN=:7863 EDGEONE_API_POOL_MIN=4 EDGEONE_API_POOL_MAX=32 ./edgeone2api
 ```
 
 ### 3. 验证
@@ -71,8 +71,8 @@ curl -s http://localhost:7863/pool
   "listen": ":7863",
   "api_key": "",
   "models": ["@makers/deepseek-v4-flash", "@makers/deepseek-v4-pro"],
-  "pool_min": 2,
-  "pool_max": 8,
+  "pool_min": 4,
+  "pool_max": 32,
   "ttl_minutes": 60,
   "bind_ttl_minutes": 30,
   "max_req_per_session": 200,
@@ -89,8 +89,8 @@ curl -s http://localhost:7863/pool
 | `listen` | `EDGEONE_API_LISTEN` | `:7863` | 监听地址 |
 | `api_key` | `EDGEONE_API_KEY` | 空 | API 鉴权 key（空=不鉴权） |
 | `models` | `EDGEONE_API_MODELS` | `[flash, pro]` | 支持的模型列表（`/v1/models` 返回） |
-| `pool_min` | `EDGEONE_API_POOL_MIN` | `2` | 会话池最小会话数 |
-| `pool_max` | `EDGEONE_API_POOL_MAX` | `8` | 会话池最大会话数（并发上限） |
+| `pool_min` | `EDGEONE_API_POOL_MIN` | `4` | 会话池最小会话数 |
+| `pool_max` | `EDGEONE_API_POOL_MAX` | `32` | 会话池最大会话数（并发上限） |
 | `ttl_minutes` | `EDGEONE_API_TTL_MINUTES` | `60` | 会话最长生命周期（分钟） |
 | `bind_ttl_minutes` | `EDGEONE_API_BIND_TTL_MINUTES` | `30` | 绑定会话（会话连续性）空闲超时（分钟） |
 | `max_req_per_session` | `EDGEONE_API_MAX_REQ_PER_SESSION` | `200` | 单会话最大请求数，超出后自动轮换 |
@@ -166,7 +166,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 ### 会话池扩容
 
-会话池在 `pool_min`（默认 2）~ `pool_max`（默认 8）之间弹性伸缩：
+会话池在 `pool_min`（默认 4）~ `pool_max`（默认 32）之间弹性伸缩：
 
 - 空闲时维护协程（15 秒周期）自动回补到 `pool_min`
 - 突发请求超过可用会话时，触发**并发后台预热**（最多 4 个会话创建并行在途），

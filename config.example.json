@@ -8,8 +8,8 @@
     "@makers/minimax-m3",
     "@makers/kimi-k2.6"
   ],
-  "pool_min": 2,
-  "pool_max": 8,
+  "pool_min": 4,
+  "pool_max": 32,
   "ttl_minutes": 60,
   "bind_ttl_minutes": 30,
   "max_req_per_session": 200,
