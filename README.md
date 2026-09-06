@@ -10,12 +10,12 @@
 - **多模型支持** — `@makers/deepseek-v4-flash`、`@makers/deepseek-v4-pro`、`@makers/kimi-k2.6`、`@makers/hy3`、`@makers/minimax-m3` 等（通过 `model_map` 配置）
 - **推理强度可调** — 支持 OpenAI 标准 `reasoning_effort` 参数（`off`/`high`/`max`）
 - **浏览器指纹隔离** — 每个会话独立 UA/Sec-CH-UA 指纹，上游将每个会话视为独立浏览器，限流互不影响
-- **弹性凭证池** — 会话池自动创建/复用/维护，配额感知轮换（绕过单一会话的用量上限）
+- **弹性凭证池** — 会话池自动创建/复用/维护，配额感知轮换（绕过单一会话的用量上限）；会话不足时并发后台扩容，突发请求不排队
 - **SSE 流式** — 流式透传上游事件流；非流式自动聚合 `content`
+- **工具调用** — 原生支持 OpenAI `tools` 参数，无需中间件即可完成 agent loop；模型输出的上游原生工具名会自动翻译为客户端声明的工具名
+- **Agent Loop 截断** — 内置 direct-reply Skill 指令，强制模型单回合收敛（直接回答或输出 tool_calls JSON），避免多轮工具循环
 - **可选鉴权** — 配置 `api_key` 后需 Bearer token 访问
 - **Go 单二进制** — 无外部依赖，`go build` 即得
-
-> 工具调用请配合 [ToolForge](https://github.com/lwjlwjlwjlwj/toolforge) 中间件使用。
 
 ## 快速开始
 
@@ -125,8 +125,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 ### `POST /v1/chat/completions`
 
-OpenAI 兼容。支持 `stream`（SSE）、`max_tokens`、`temperature`、`top_p`、`reasoning_effort`。
-不支持 `tools` 参数，工具调用请配合 [ToolForge](https://github.com/lwjlwjlwjlwj/toolforge) 使用。
+OpenAI 兼容。支持 `stream`（SSE）、`max_tokens`、`temperature`、`top_p`、`reasoning_effort`、`tools`（见下方「工具调用」）。
 
 ### `GET /v1/models`
 
@@ -144,6 +143,35 @@ OpenAI 兼容。支持 `stream`（SSE）、`max_tokens`、`temperature`、`top_p
 
 通过 `X-Session-Key` 请求头关联会话：同一 key 的请求复用同一上游会话（保留对话上下文）。
 未提供时自动生成 key。会话达到 `max_req_per_session` 或连续失败后自动轮换为全新会话。
+
+## 工具调用与工具名翻译
+
+网关原生支持 OpenAI `tools` 参数：客户端声明工具后，模型在单回合内返回标准 `tool_calls`
+（流式/非流式一致），客户端执行后把结果以 `role: "tool"` 消息回传即可续接对话。
+
+```bash
+curl -s http://localhost:7863/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "@makers/deepseek-v4-flash",
+    "messages": [{"role": "user", "content": "读取 /etc/hostname 的内容"}],
+    "tools": [{"type": "function", "function": {"name": "read_file", "description": "读取文件", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}]
+  }'
+```
+
+上游模型倾向输出其**原生工具名**（如 `read`/`bash`/`glob`），而客户端可能声明了不同的名字
+（如 `read_file`/`run_command`/`search_files`）。网关内置**工具名翻译层**，将上游原生名
+按别名映射表重写为客户端实际声明的工具名；已匹配或无法映射的名字原样透传（并输出告警日志）。
+同时系统指令会约束模型「只使用声明列表中的工具名」，从源头降低翻译需求。
+
+### 会话池扩容
+
+会话池在 `pool_min`（默认 2）~ `pool_max`（默认 8）之间弹性伸缩：
+
+- 空闲时维护协程（15 秒周期）自动回补到 `pool_min`
+- 突发请求超过可用会话时，触发**并发后台预热**（最多 4 个会话创建并行在途），
+  请求以 300ms 轮询等待新会话就绪，而不是串行排队创建
+- 任一指纹（浏览器身份）被上游限流后进入 24h 冷却，不再参与会话创建
 
 ## 逆向说明
 
@@ -177,10 +205,16 @@ docker compose up -d --build
 edgeone2api/
 ├── cmd/server/main.go            # 入口：配置、会话池初始化、HTTP 服务
 ├── internal/
-│   ├── auth/pool.go              # 会话池：创建/绑定/轮换/维护（核心）
+│   ├── auth/pool.go              # 会话池：创建/绑定/轮换/并发预热扩容（核心）
+│   ├── auth/pool_test.go         # 会话池单测（含并发扩容回归）
 │   ├── config/config.go          # 配置加载 + model_map + env override
 │   ├── upstream/client.go        # Harness RPC 客户端 + 浏览器指纹 + SSE 读取
-│   └── server/server.go          # OpenAI 兼容 handler + 流式/非流式
+│   ├── upstream/skills.go        # direct-reply Skill 指令（Agent Loop 截断）
+│   ├── server/server.go          # OpenAI 兼容 handler + 流式/非流式 + 工具调用
+│   ├── server/tools.go           # 工具名翻译层（上游原生名 → 客户端声明名）
+│   ├── server/tools_test.go      # 翻译层单测
+│   └── toolcall/                 # 可选的工具调用中间件（独立部署）
+├── .trae/skills/direct-reply/    # direct-reply Skill 源文件
 ├── config.example.json
 ├── Dockerfile
 ├── docker-compose.yml

@@ -25,3 +25,6 @@ Thumbs.db
 
 # Config (contains secrets)
 config.json
+
+# Scratch / temp
+tmp/

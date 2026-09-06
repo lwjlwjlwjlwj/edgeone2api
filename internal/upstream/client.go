@@ -29,9 +29,9 @@ type RPCResponse struct {
 	Type   string `json:"type"`
 	RpcID  string `json:"rpcId"`
 	Result struct {
-		OK     bool            `json:"ok"`
-		Value  json.RawMessage `json:"value"`
-		Error  *RPCError       `json:"error"`
+		OK    bool            `json:"ok"`
+		Value json.RawMessage `json:"value"`
+		Error *RPCError       `json:"error"`
 	} `json:"result"`
 }
 
@@ -44,11 +44,11 @@ type RPCError struct {
 
 // ContentItem represents a content item in the session.prompt payload
 type ContentItem struct {
-	Type   string          `json:"type"`
-	Text   string          `json:"text,omitempty"`
-	ToolCall  string       `json:"toolCallId,omitempty"`
-	Content []ContentPart  `json:"content,omitempty"`
-	IsError bool           `json:"isError,omitempty"`
+	Type     string        `json:"type"`
+	Text     string        `json:"text,omitempty"`
+	ToolCall string        `json:"toolCallId,omitempty"`
+	Content  []ContentPart `json:"content,omitempty"`
+	IsError  bool          `json:"isError,omitempty"`
 }
 
 // ContentPart is a nested content part (for tool results)
@@ -166,6 +166,7 @@ func NewClient(baseURL string) *Client {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ResponseHeaderTimeout: 0,
+		Proxy:                 http.ProxyFromEnvironment,
 	}
 	return &Client{
 		baseURL: baseURL,
@@ -173,6 +174,12 @@ func NewClient(baseURL string) *Client {
 		hc:      &http.Client{Timeout: 120 * time.Second, Transport: transport},
 		sseHC:   &http.Client{Transport: transport},
 	}
+}
+
+// FingerprintSignature returns a stable identity for this client's browser
+// fingerprint, used to track exhausted fingerprints.
+func (c *Client) FingerprintSignature() string {
+	return c.fp.UserAgent + "\x00" + c.fp.SecChUA + "\x00" + c.fp.SecChUAPlat + "\x00" + c.fp.AcceptLang
 }
 
 // CreateSession creates a new session and returns conversation ID and session ID.
@@ -445,10 +452,10 @@ func randHex(n int) string {
 
 // AssistantChunk is a parsed text/reasoning/tool-call delta from an assistant/chunk event
 type AssistantChunk struct {
-	Text      string
-	Reasoning string
-	ToolCall  *AssistantToolCall
-	IsDone    bool
+	Text         string
+	Reasoning    string
+	ToolCall     *AssistantToolCall
+	IsDone       bool
 	FinishReason string // "stop" | "tool_calls"
 }
 
@@ -457,9 +464,9 @@ type AssistantToolCall struct {
 	Index          int
 	ID             string
 	Name           string
-	Arguments      string   // accumulated arguments
-	ArgumentsDelta string   // current delta
-	IsComplete     bool     // true for block-end (full arguments available)
+	Arguments      string // accumulated arguments
+	ArgumentsDelta string // current delta
+	IsComplete     bool   // true for block-end (full arguments available)
 }
 
 // ChatResult holds the final outcome of a chat turn
@@ -498,6 +505,16 @@ func (c *Client) StartChat(ctx context.Context, sessionID, convID string, items 
 		envCh:     envCh,
 		cancelSSE: func() { cancelSSE(); cancelStream() },
 	}, nil
+}
+
+func (c *Client) InitSession(ctx context.Context, sessionID, convID string) error {
+	cs, err := c.StartChat(ctx, sessionID, convID, DirectReplyInitPrompt())
+	if err != nil {
+		return err
+	}
+	defer cs.Cancel()
+	_, err = c.StreamEvents(ctx, cs, nil)
+	return err
 }
 
 // Cancel aborts the chat stream early

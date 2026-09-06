@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -84,6 +85,30 @@ type openaiChatRequest struct {
 	MaxTokens       int             `json:"max_tokens"`
 	Temperature     float64         `json:"temperature"`
 	ReasoningEffort string          `json:"reasoning_effort"`
+	Tools           []openaiTool    `json:"tools"`
+}
+
+type openaiTool struct {
+	Type     string         `json:"type"`
+	Function openaiToolFunc `json:"function"`
+}
+
+type openaiToolFunc struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters"`
+}
+
+// openaiToolCall mirrors the OpenAI tool_calls message field returned to the client
+type openaiToolCall struct {
+	ID       string           `json:"id"`
+	Type     string           `json:"type"`
+	Function openaiToolCallFn `json:"function"`
+}
+
+type openaiToolCallFn struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 type openaiMessage struct {
@@ -126,21 +151,32 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[CHAT] model=%s stream=%v msgs=%d", model, req.Stream, len(req.Messages))
 
-	items := convertMessages(req.Messages)
-
-	// Session affinity: every request gets a session key for continuity.
+	// Session affinity: a client that sends X-Session-Key gets a bound,
+	// stateful session for continuity.  Anonymous requests (no header) use a
+	// stateless free-pool session and release it afterwards, so they can not
+	// exhaust the pool.
 	sessionKey := r.Header.Get("X-Session-Key")
-	if sessionKey == "" {
-		sessionKey = "auto-" + randHex(16)
-	}
+	bound := sessionKey != ""
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.timeout)
 	defer cancel()
 
-	session, err := s.pool.Bind(ctx, sessionKey)
-	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": map[string]any{"message": "no available session: " + err.Error(), "type": "server_error"}})
-		return
+	var session *auth.Session
+	var release func(bool)
+	if bound {
+		session, err = s.pool.Bind(ctx, sessionKey)
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": map[string]any{"message": "no available session: " + err.Error(), "type": "server_error"}})
+			return
+		}
+		release = func(success bool) { s.pool.ReleaseBind(sessionKey, session, success) }
+	} else {
+		session, err = s.pool.Acquire(ctx)
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": map[string]any{"message": "no available session: " + err.Error(), "type": "server_error"}})
+			return
+		}
+		release = func(success bool) { s.pool.Release(session, success) }
 	}
 
 	// Resolve model mapping and apply selectModel if needed.
@@ -169,36 +205,84 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	chatID := "chatcmpl-" + randHex(24)
 	created := time.Now().Unix()
 
+	toolsJSON := ""
+	declared := declaredToolSet{}
+	if len(req.Tools) > 0 {
+		if b, err := json.Marshal(req.Tools); err == nil {
+			toolsJSON = string(b)
+		}
+		for _, t := range req.Tools {
+			declared[t.Function.Name] = t
+		}
+	}
+
 	if req.Stream {
-		s.streamChat(w, ctx, session, chatID, model, created, items, sessionKey)
+		s.streamChat(w, ctx, session, chatID, model, created, req.Messages, sessionKey, release, func(ctx context.Context) (*auth.Session, error) {
+			if bound {
+				return s.pool.Bind(ctx, sessionKey)
+			}
+			return s.pool.Acquire(ctx)
+		}, toolsJSON, declared)
 	} else {
-		s.nonStreamChat(w, ctx, session, chatID, model, created, items, sessionKey)
+		s.nonStreamChat(w, ctx, session, chatID, model, created, req.Messages, sessionKey, release, func(ctx context.Context) (*auth.Session, error) {
+			if bound {
+				return s.pool.Bind(ctx, sessionKey)
+			}
+			return s.pool.Acquire(ctx)
+		}, toolsJSON, declared)
 	}
 }
 
-func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, items []upstream.ContentItem, sessionKey string) {
+// toOpenAIToolCalls converts upstream-native assistant tool calls into the
+// OpenAI tool_calls message shape returned to the client.
+func toOpenAIToolCalls(tcs []upstream.AssistantToolCall) []openaiToolCall {
+	if len(tcs) == 0 {
+		return nil
+	}
+	calls := make([]openaiToolCall, 0, len(tcs))
+	for i, tc := range tcs {
+		id := tc.ID
+		if id == "" {
+			id = fmt.Sprintf("call_%s_%d", randHex(6), i)
+		}
+		calls = append(calls, openaiToolCall{
+			ID:   id,
+			Type: "function",
+			Function: openaiToolCallFn{
+				Name:      tc.Name,
+				Arguments: tc.Arguments,
+			},
+		})
+	}
+	return calls
+}
+
+func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, msgs []openaiMessage, sessionKey string, release func(bool), reacquire func(context.Context) (*auth.Session, error), toolsJSON string, declared declaredToolSet) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		s.pool.ReleaseBind(sessionKey, session, false)
+		release(false)
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "streaming unsupported"})
 		return
 	}
 
-	// Try once with the bound session; if quota error, retry with a fresh one.
+	userText := lastUserMessage(msgs)
+
+	// Try once with the current session; if quota error, retry with a fresh one.
 	for attempt := 0; attempt < 2; attempt++ {
+		items := s.buildItems(session, sessionKey, msgs, toolsJSON)
 		cs, err := session.Client.StartChat(ctx, session.SessionID, session.ConversationID, items)
 		if err != nil {
 			if upstream.IsQuotaError(err) {
 				session.MarkQuotaExceeded()
-				s.pool.ReleaseBind(sessionKey, session, false)
-				session, err = s.pool.Bind(ctx, sessionKey)
+				release(false)
+				session, err = reacquire(ctx)
 				if err != nil {
 					writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": map[string]any{"message": "no available session: " + err.Error(), "type": "server_error"}})
 					return
 				}
 				continue // retry
 			}
-			s.pool.ReleaseBind(sessionKey, session, false)
+			release(false)
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": "upstream error: " + err.Error(), "type": "upstream_error"}})
 			return
 		}
@@ -219,81 +303,145 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 		success := false
 
 		defer func() {
-			s.pool.ReleaseBind(sessionKey, session, success)
+			release(success)
 		}()
 
-		_, streamErr := session.Client.StreamEvents(ctx, cs, func(chunk upstream.AssistantChunk) {
+		var sb strings.Builder
+		var result upstream.ChatResult
+		var streamErr error
+		// nativeToolCalls tracks whether upstream emitted real tool-call events
+		// mid-stream (vs. the mode-B text protocol parsed after the turn).
+		nativeToolCall := false
+		toolSeen := make(map[int]bool) // index -> name delta sent
+		result, streamErr = session.Client.StreamEvents(ctx, cs, func(chunk upstream.AssistantChunk) {
 			if chunk.IsDone {
-				emitFinish(w, chatID, model, created, "stop")
-				flusher.Flush()
-				return
+				return // finish chunk is emitted after StreamEvents returns
 			}
 
 			delta := map[string]any{}
 			if chunk.Text != "" {
+				sb.WriteString(chunk.Text)
 				delta["content"] = chunk.Text
 			}
 			if chunk.Reasoning != "" {
 				delta["reasoning_content"] = chunk.Reasoning
+			}
+			if chunk.ToolCall != nil {
+				tc := chunk.ToolCall
+				nativeToolCall = true
+				if tc.Name != "" && !toolSeen[tc.Index] {
+					toolSeen[tc.Index] = true
+					delta["role"] = "assistant"
+					delta["content"] = nil
+					delta["tool_calls"] = []any{map[string]any{
+						"index":    tc.Index,
+						"id":       tc.ID,
+						"type":     "function",
+						"function": map[string]any{"name": translateToolCallName(tc.Name, declared), "arguments": tc.ArgumentsDelta},
+					}}
+				} else if tc.ArgumentsDelta != "" {
+					delta["tool_calls"] = []any{map[string]any{
+						"index":    tc.Index,
+						"function": map[string]any{"arguments": tc.ArgumentsDelta},
+					}}
+				} else if tc.IsComplete && tc.Arguments != "" {
+					delta["tool_calls"] = []any{map[string]any{
+						"index":    tc.Index,
+						"function": map[string]any{"arguments": tc.Arguments},
+					}}
+				}
 			}
 			if len(delta) > 0 {
 				emitSSE(w, chatID, model, created, delta)
 				flusher.Flush()
 			}
 		})
+		logTools(sessionKey, result.ToolCalls)
+		finishReason := "stop"
 		if streamErr != nil {
 			log.Printf("[STREAM] error: %v", streamErr)
 			success = false
 		} else {
 			success = true
+			if sessionKey != "" {
+				s.pool.AppendHistory(sessionKey, session.SessionID, userText, sb.String())
+			}
+			if nativeToolCall || len(result.ToolCalls) > 0 {
+				finishReason = "tool_calls"
+			} else if calls := parseToolCalls(sb.String()); calls != nil {
+				emitToolCallsSSE(w, chatID, model, created, translateToolCalls(calls, declared))
+				flusher.Flush()
+				finishReason = "tool_calls"
+			}
 		}
 
-		emitFinish(w, chatID, model, created, "stop")
+		emitFinish(w, chatID, model, created, finishReason)
 		flusher.Flush()
 		return
 	}
 	// Both attempts failed
-	s.pool.ReleaseBind(sessionKey, session, false)
+	release(false)
 	writeJSON(w, http.StatusBadGateway, map[string]any{"error": "upstream quota exceeded, retry later"})
 }
 
-func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, items []upstream.ContentItem, sessionKey string) {
+func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, msgs []openaiMessage, sessionKey string, release func(bool), reacquire func(context.Context) (*auth.Session, error), toolsJSON string, declared declaredToolSet) {
 	var result upstream.ChatResult
 	var err error
 
+	userText := lastUserMessage(msgs)
+
 	for attempt := 0; attempt < 2; attempt++ {
 		var cs *upstream.ChatStream
+		items := s.buildItems(session, sessionKey, msgs, toolsJSON)
 		cs, err = session.Client.StartChat(ctx, session.SessionID, session.ConversationID, items)
 		if err != nil {
 			if upstream.IsQuotaError(err) {
 				session.MarkQuotaExceeded()
-				s.pool.ReleaseBind(sessionKey, session, false)
-				session, err = s.pool.Bind(ctx, sessionKey)
+				release(false)
+				session, err = reacquire(ctx)
 				if err != nil {
 					writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": map[string]any{"message": "no available session: " + err.Error(), "type": "server_error"}})
 					return
 				}
 				continue
 			}
-			s.pool.ReleaseBind(sessionKey, session, false)
+			release(false)
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": "upstream error: " + err.Error(), "type": "upstream_error"}})
 			return
 		}
 		result, err = session.Client.StreamEvents(ctx, cs, nil)
+		logTools(sessionKey, result.ToolCalls)
 		if err != nil {
 			log.Printf("[CHAT] stream error: %v", err)
 		}
 		break
 	}
 	if err != nil {
-		s.pool.ReleaseBind(sessionKey, session, false)
+		release(false)
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": "upstream error: " + err.Error(), "type": "upstream_error"}})
 		return
 	}
 
 	success := true
+	if sessionKey != "" {
+		s.pool.AppendHistory(sessionKey, session.SessionID, userText, result.Text)
+	}
 
 	msg := map[string]any{"role": "assistant", "content": result.Text}
+	finish := "stop"
+	// Prefer the upstream-native tool calls (real tool-call events), falling
+	// back to the direct-reply mode-B text protocol when the model emitted a
+	// tool_calls JSON as plain text instead.  Both paths go through the tool
+	// translation layer so tool names match the client's declared set.
+	if calls := translateToolCalls(toOpenAIToolCalls(result.ToolCalls), declared); len(calls) > 0 {
+		msg["content"] = nil
+		msg["tool_calls"] = calls
+		finish = "tool_calls"
+	} else if calls := translateToolCalls(parseToolCalls(result.Text), declared); calls != nil {
+		msg["content"] = nil
+		msg["tool_calls"] = calls
+		finish = "tool_calls"
+	}
 
 	resp := map[string]any{
 		"id":      chatID,
@@ -304,7 +452,7 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 			{
 				"index":         0,
 				"message":       msg,
-				"finish_reason": "stop",
+				"finish_reason": finish,
 			},
 		},
 		"usage": map[string]any{
@@ -314,17 +462,44 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 		},
 	}
 
-	s.pool.ReleaseBind(sessionKey, session, success)
+	release(success)
 	w.Header().Set("X-Session-Key", sessionKey)
 	writeJSON(w, http.StatusOK, resp)
 }
 
 // --- Message conversion ---
 
+// buildItems assembles the prompt for a session: the direct-reply skill
+// directive (with declared tools when any), an optional cache-hit replay of
+// the previous dialog history, then the request messages.  Replay is
+// recomputed per session so a fresh session created by a quota retry inherits
+// the cached context automatically.
+func (s *Server) buildItems(session *auth.Session, sessionKey string, msgs []openaiMessage, toolsJSON string) []upstream.ContentItem {
+	items := []upstream.ContentItem{{Type: "text", Text: upstream.BuildDirective(toolsJSON)}}
+	if sessionKey != "" {
+		if replay := s.pool.ReplayHistory(sessionKey, session.SessionID); len(replay) > 0 {
+			items = append(items, upstream.ContentItem{Type: "text", Text: formatReplay(replay)})
+		}
+	}
+	return append(items, convertMessages(msgs)...)
+}
+
+func formatReplay(turns []auth.DialogTurn) string {
+	var sb strings.Builder
+	sb.WriteString("[Cache Hit - Previous Conversation Context (already happened, for reference only)]\n")
+	for _, t := range turns {
+		if t.Role == "assistant" {
+			sb.WriteString("assistant: " + t.Text + "\n")
+		} else {
+			sb.WriteString("user: " + t.Text + "\n")
+		}
+	}
+	sb.WriteString("[End of Previous Context - answer the latest user message only]\n")
+	return sb.String()
+}
+
 func convertMessages(msgs []openaiMessage) []upstream.ContentItem {
 	var items []upstream.ContentItem
-
-	items = append(items, upstream.ContentItem{Type: "text", Text: "[System Directive]\nYou are an AI assistant accessed through an API. Answer the user's question directly and concisely.\n---\n"})
 
 	for _, msg := range msgs {
 		switch msg.Role {
@@ -344,8 +519,13 @@ func convertMessages(msgs []openaiMessage) []upstream.ContentItem {
 				items = append(items, upstream.ContentItem{Type: "text", Text: text})
 			}
 		case "tool":
-			// Tool calls are not supported; skip tool role messages
-			continue
+			// Tool result message echoed back by the client after it executed
+			// a tool_call: pass it through so the model can give the final
+			// answer in the same conversation.
+			text := extractContent(msg.Content)
+			if text != "" {
+				items = append(items, upstream.ContentItem{Type: "text", Text: "[Tool Result] " + text})
+			}
 		}
 	}
 	return items
@@ -373,6 +553,83 @@ func extractContent(raw json.RawMessage) string {
 		return sb.String()
 	}
 	return string(bytes.Trim(raw, "\""))
+}
+
+func lastUserMessage(msgs []openaiMessage) string {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "user" {
+			if t := extractContent(msgs[i].Content); t != "" {
+				return t
+			}
+		}
+	}
+	return ""
+}
+
+// logTools records any tool calls the upstream model actually emitted for a
+// request.  Under the direct-reply skill the expectation is zero tool calls
+// (single-turn direct answer); any tool call here means the skill was not
+// honored and the agent loop was not truncated.
+func logTools(sessionKey string, calls []upstream.AssistantToolCall) {
+	if len(calls) == 0 {
+		log.Printf("[TOOLS] key=%s tool_calls=none", sessionKey)
+		return
+	}
+	for _, tc := range calls {
+		args := tc.Arguments
+		if len(args) > 160 {
+			args = args[:160] + "..."
+		}
+		log.Printf("[TOOLS] key=%s tool_call name=%s args=%s", sessionKey, tc.Name, args)
+	}
+}
+
+// parseToolCalls tries to interpret the model's text output as a tool_calls
+// JSON (mode B of the direct-reply skill).  It tolerates a surrounding code
+// fence.  Returns nil when the text is not a tool_calls JSON, meaning the
+// model answered directly (mode A).
+func parseToolCalls(text string) []openaiToolCall {
+	t := strings.TrimSpace(text)
+	t = strings.TrimPrefix(t, "```json")
+	t = strings.TrimPrefix(t, "```")
+	t = strings.TrimSuffix(t, "```")
+	t = strings.TrimSpace(t)
+	var parsed struct {
+		ToolCalls []struct {
+			ID       string `json:"id"`
+			Type     string `json:"type"`
+			Function struct {
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			} `json:"function"`
+		} `json:"tool_calls"`
+	}
+	if err := json.Unmarshal([]byte(t), &parsed); err != nil {
+		return nil
+	}
+	if len(parsed.ToolCalls) == 0 {
+		return nil
+	}
+	calls := make([]openaiToolCall, 0, len(parsed.ToolCalls))
+	for i, c := range parsed.ToolCalls {
+		typ := c.Type
+		if typ == "" {
+			typ = "function"
+		}
+		id := c.ID
+		if id == "" {
+			id = fmt.Sprintf("call_%s_%d", randHex(6), i)
+		}
+		calls = append(calls, openaiToolCall{
+			ID:   id,
+			Type: typ,
+			Function: openaiToolCallFn{
+				Name:      c.Function.Name,
+				Arguments: c.Function.Arguments,
+			},
+		})
+	}
+	return calls
 }
 
 // --- SSE helpers ---
@@ -409,6 +666,26 @@ func emitFinish(w http.ResponseWriter, chatID, model string, created int64, fini
 	d, _ := json.Marshal(out)
 	w.Write([]byte("data: " + string(d) + "\n\n"))
 	w.Write([]byte("data: [DONE]\n\n"))
+}
+
+// emitToolCallsSSE sends the complete tool_calls payload as a streaming chunk
+// with finish_reason="tool_calls", so streaming clients get the same
+// tool_calls contract as the non-streaming path.
+func emitToolCallsSSE(w http.ResponseWriter, chatID, model string, created int64, calls []openaiToolCall) {
+	delta := map[string]any{
+		"role":       "assistant",
+		"content":    nil,
+		"tool_calls": calls,
+	}
+	out := map[string]any{
+		"id":      chatID,
+		"model":   model,
+		"created": created,
+		"object":  "chat.completion.chunk",
+		"choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": "tool_calls"}},
+	}
+	d, _ := json.Marshal(out)
+	w.Write([]byte("data: " + string(d) + "\n\n"))
 }
 
 // --- Health / Pool ---
