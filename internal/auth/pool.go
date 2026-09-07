@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"sync"
 	"time"
 
@@ -85,16 +86,18 @@ type boundEntry struct {
 // Pool manages a pool of sessions shared across clients, plus
 // per-key bound sessions for conversation continuity.
 type Pool struct {
-	mu       sync.RWMutex           // guards free/binds
-	free     []*Session             // sessions available for generic assignment
-	binds    map[string]*boundEntry // key → bound session
-	config   PoolConfig
+	mu     sync.RWMutex           // guards free/binds
+	free   []*Session             // sessions available for generic assignment
+	binds  map[string]*boundEntry // key → bound session
+	config PoolConfig
 
-	cacheMu   sync.Mutex
-	cache     map[string][]DialogTurn // key → dialog history (cache-hit source)
-	lastSrv   map[string]string       // key → sessionID that most recently served it
-	cacheLast map[string]time.Time    // key → last activity, for cache expiry
-	replays   int64                   // total cache-hit replays delivered
+	cacheMu      sync.Mutex
+	cache        map[string][]DialogTurn // key → dialog history (cache-hit source)
+	lastSrv      map[string]string       // key → sessionID that most recently served it
+	cacheLast    map[string]time.Time    // key → last activity, for cache expiry
+	replays      int64                   // total cache-hit replays delivered
+	replayHits   int64                   // total dialog-cache hits (key had history)
+	replayMisses int64                   // total dialog-cache misses (key had no history)
 
 	fpMu        sync.Mutex
 	exhaustedFP map[string]time.Time // fingerprint sig → exhausted-at (24h cooldown)
@@ -482,14 +485,23 @@ func (p *Pool) cleanupExhausted() {
 // upstream conversation already carries the context (cache hit in-session)
 // and nothing is replayed.  Otherwise the full cached history is returned so
 // a fresh session can rebuild the conversation ("缓存命中").
+//
+// Hit-rate accounting:
+//   - hits: the key already has cached dialog history (len(turns)>0), regardless
+//     of whether we can short-circuit by using the same live session.
+//   - misses: the key has no cached history, so nothing can be reused.
+//   - replays: the subset of hits where we actually replay history into a
+//     fresh session (i.e. lastSrv != current session).
 func (p *Pool) ReplayHistory(key, sessionID string) []DialogTurn {
 	p.cacheMu.Lock()
 	defer p.cacheMu.Unlock()
-	if p.lastSrv[key] == sessionID {
-		return nil
-	}
 	turns := p.cache[key]
 	if len(turns) == 0 {
+		p.replayMisses++
+		return nil
+	}
+	p.replayHits++
+	if p.lastSrv[key] == sessionID {
 		return nil
 	}
 	p.replays++
@@ -571,6 +583,13 @@ func (p *Pool) Stats() map[string]interface{} {
 	p.cacheMu.Lock()
 	dialogKeys := len(p.cache)
 	dialogReplays := p.replays
+	dialogHits := p.replayHits
+	dialogMisses := p.replayMisses
+	dialogTotal := dialogHits + dialogMisses
+	var dialogHitRate float64
+	if dialogTotal > 0 {
+		dialogHitRate = float64(dialogHits) / float64(dialogTotal)
+	}
 	p.cacheMu.Unlock()
 
 	p.fpMu.Lock()
@@ -578,18 +597,21 @@ func (p *Pool) Stats() map[string]interface{} {
 	p.fpMu.Unlock()
 
 	stats := map[string]interface{}{
-		"free":           freeN,
-		"bound":          boundN,
-		"total":          freeN + boundN,
-		"min":            p.config.MinSize,
-		"max":            p.config.MaxSize,
-		"ttl_s":          p.config.TTL.Seconds(),
-		"bind_ttl_s":     p.config.BindTTL.Seconds(),
-		"active":         active,
-		"failed":         failed,
-		"dialog_keys":    dialogKeys,
-		"dialog_replays": dialogReplays,
-		"exhausted_fps":  exhaustedFPs,
+		"free":            freeN,
+		"bound":           boundN,
+		"total":           freeN + boundN,
+		"min":             p.config.MinSize,
+		"max":             p.config.MaxSize,
+		"ttl_s":           p.config.TTL.Seconds(),
+		"bind_ttl_s":      p.config.BindTTL.Seconds(),
+		"active":          active,
+		"failed":          failed,
+		"dialog_keys":     dialogKeys,
+		"dialog_replays":  dialogReplays,
+		"dialog_hits":     dialogHits,
+		"dialog_misses":   dialogMisses,
+		"dialog_hit_rate": math.Round(dialogHitRate*10000) / 10000,
+		"exhausted_fps":   exhaustedFPs,
 	}
 	return stats
 }

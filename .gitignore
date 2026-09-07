@@ -28,3 +28,8 @@ config.json
 
 # Scratch / temp
 tmp/
+
+# Local build / run artifacts
+/edgeone2api
+*.log
+*.pid
