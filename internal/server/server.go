@@ -375,7 +375,7 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 			}
 		}
 
-		emitFinish(w, chatID, model, created, finishReason, usageOf(result.TokenUsage))
+		emitFinish(w, chatID, model, created, finishReason)
 		flusher.Flush()
 		return
 	}
@@ -458,33 +458,16 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 				"finish_reason": finish,
 			},
 		},
-		"usage": usageOf(result.TokenUsage),
+		"usage": map[string]any{
+			"prompt_tokens":     0,
+			"completion_tokens": 0,
+			"total_tokens":      0,
+		},
 	}
 
 	release(success)
 	w.Header().Set("X-Session-Key", sessionKey)
 	writeJSON(w, http.StatusOK, resp)
-}
-
-// usageOf renders the upstream TokenUsage projection into the OpenAI standard
-// usage object.  prompt_tokens = uncached + cache-read; completion_tokens =
-// output; the cache-read figure is surfaced both in prompt_tokens_details
-// (standard field) and as a top-level cache_read_tokens alias so callers that
-// bill DeepSeek-style can read it directly.
-func usageOf(tu upstream.TokenUsage) map[string]any {
-	prompt := tu.UncachedInputTokens + tu.CacheReadTokens
-	usage := map[string]any{
-		"prompt_tokens":     prompt,
-		"completion_tokens": tu.OutputTokens,
-		"total_tokens":      prompt + tu.OutputTokens,
-		"prompt_tokens_details": map[string]any{
-			"cached_tokens": tu.CacheReadTokens,
-		},
-		"cache_read_tokens":     tu.CacheReadTokens,
-		"cache_write_tokens":    tu.CacheWriteTokens,
-		"uncached_input_tokens": tu.UncachedInputTokens,
-	}
-	return usage
 }
 
 // --- Message conversion ---
@@ -675,16 +658,13 @@ func emitSSE(w http.ResponseWriter, chatID, model string, created int64, delta m
 	w.Write([]byte("data: " + string(d) + "\n\n"))
 }
 
-func emitFinish(w http.ResponseWriter, chatID, model string, created int64, finish string, usage map[string]any) {
+func emitFinish(w http.ResponseWriter, chatID, model string, created int64, finish string) {
 	out := map[string]any{
 		"id":      chatID,
 		"model":   model,
 		"created": created,
 		"object":  "chat.completion.chunk",
 		"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": finish}},
-	}
-	if len(usage) > 0 {
-		out["usage"] = usage
 	}
 	d, _ := json.Marshal(out)
 	w.Write([]byte("data: " + string(d) + "\n\n"))

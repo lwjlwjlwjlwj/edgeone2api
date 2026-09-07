@@ -469,23 +469,12 @@ type AssistantToolCall struct {
 	IsComplete     bool   // true for block-end (full arguments available)
 }
 
-// TokenUsage mirrors the upstream session/projection tokenUsage value.
-// It exposes DeepSeek-style cache accounting: cacheReadTokens is the
-// “缓存读取” (cached-token read) figure DeepSeek bills differently.
-type TokenUsage struct {
-	UncachedInputTokens int64 `json:"uncachedInputTokens"`
-	OutputTokens        int64 `json:"outputTokens"`
-	CacheReadTokens     int64 `json:"cacheReadTokens"`
-	CacheWriteTokens    int64 `json:"cacheWriteTokens"`
-}
-
 // ChatResult holds the final outcome of a chat turn
 type ChatResult struct {
 	Text         string
 	Reasoning    string // accumulated reasoning-delta text (thinking trace)
 	FinishReason string // "stop" | "tool_calls"
 	ToolCalls    []AssistantToolCall
-	TokenUsage   TokenUsage // final upstream token-usage projection (may be zero)
 }
 
 // ChatStream holds an active chat session: SSE stream + prompt context
@@ -542,7 +531,6 @@ func (cs *ChatStream) Cancel() {
 func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(AssistantChunk)) (ChatResult, error) {
 	var sb strings.Builder
 	var reasoningSb strings.Builder
-	var tu TokenUsage
 	var turn int
 	finishReason := "stop"
 	toolCalls := make(map[int]*AssistantToolCall)
@@ -555,7 +543,7 @@ func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(
 				ordered = append(ordered, *tc)
 			}
 		}
-		return ChatResult{Text: sb.String(), Reasoning: reasoningSb.String(), FinishReason: finishReason, ToolCalls: ordered, TokenUsage: tu}
+		return ChatResult{Text: sb.String(), Reasoning: reasoningSb.String(), FinishReason: finishReason, ToolCalls: ordered}
 	}
 
 	for {
@@ -565,39 +553,6 @@ func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(
 		case env, ok := <-cs.envCh:
 			if !ok {
 				return result(), nil
-			}
-			// session/projection envelopes carry the tokenUsage/context stats;
-			// they are NOT server-request/session/event, so handle them first.
-			// The projection identity lives in Payload.type (the outer envelope's
-			// Type field appears to be empty for these), so probe Payload itself.
-			var pt struct {
-				Type string `json:"type"`
-			}
-			if err := json.Unmarshal(env.Payload, &pt); err != nil {
-				continue
-			}
-			if pt.Type == "session/projection" {
-				var proj struct {
-					Key   string `json:"key"`
-					Value struct {
-						UncachedInputTokens int64 `json:"uncachedInputTokens"`
-						OutputTokens        int64 `json:"outputTokens"`
-						CacheReadTokens     int64 `json:"cacheReadTokens"`
-						CacheWriteTokens    int64 `json:"cacheWriteTokens"`
-					} `json:"value"`
-				}
-				if err := json.Unmarshal(env.Payload, &proj); err != nil {
-					continue
-				}
-				if proj.Key == "tokenUsage" {
-					tu = TokenUsage{
-						UncachedInputTokens: proj.Value.UncachedInputTokens,
-						OutputTokens:        proj.Value.OutputTokens,
-						CacheReadTokens:     proj.Value.CacheReadTokens,
-						CacheWriteTokens:    proj.Value.CacheWriteTokens,
-					}
-				}
-				continue
 			}
 			if env.Type != "server-request" || env.Method != "session/event" {
 				continue
