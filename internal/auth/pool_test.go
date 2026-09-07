@@ -227,6 +227,17 @@ func waitFor(t *testing.T, what string, want int, get func() int) {
 	}
 }
 
+func waitAtLeast(t *testing.T, what string, min int, get func() int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for get() < min && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := get(); got < min {
+		t.Fatalf("%s: want >= %d, got %d", what, min, got)
+	}
+}
+
 // TestWarmCapsConcurrentCreates verifies the background warm path caps the
 // number of parallel session creations (bounded burst scaling, not one
 // session per RPC round-trip) and that every spawned create lands in the pool.
@@ -247,7 +258,10 @@ func TestWarmCapsConcurrentCreates(t *testing.T) {
 		t.Fatalf("in-flight warms %d exceed cap %d", n, p.maxConcurrentWarm)
 	}
 
-	waitFor(t, "warm creates landing", p.maxConcurrentWarm, p.Count)
+	// At least maxConcurrentWarm lands: the pool maintainer may warm one
+	// extra session when the pool is empty, so assert a floor, not an exact
+	// count.  The real invariant is the bounded parallel-creation cap below.
+	waitAtLeast(t, "warm creates landing", p.maxConcurrentWarm, p.Count)
 	if got := maxInflight.Load(); got != int32(p.maxConcurrentWarm) {
 		t.Fatalf("expected %d parallel creates, observed max concurrency %d", p.maxConcurrentWarm, got)
 	}
