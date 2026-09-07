@@ -437,7 +437,7 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 	}
 	finish := "stop"
 	// Prefer the upstream-native tool calls (real tool-call events), falling
-	// back to the direct-reply mode-B text protocol when the model emitted a
+	// back to the declared-tool JSON text protocol when the model emitted a
 	// tool_calls JSON as plain text instead.  Both paths go through the tool
 	// translation layer so tool names match the client's declared set.
 	if calls := translateToolCalls(toOpenAIToolCalls(result.ToolCalls), declared); len(calls) > 0 {
@@ -476,7 +476,7 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 
 // --- Message conversion ---
 
-// buildItems assembles the prompt for a session: the direct-reply skill
+// buildItems assembles the prompt for a session: the tool-definition
 // directive (with declared tools when any), an optional cache-hit replay of
 // the previous dialog history, then the request messages.  Replay is
 // recomputed per session so a fresh session created by a quota retry inherits
@@ -603,9 +603,9 @@ func lastUserMessage(msgs []openaiMessage) string {
 }
 
 // logTools records any tool calls the upstream model actually emitted for a
-// request.  Under the direct-reply skill the expectation is zero tool calls
-// (single-turn direct answer); any tool call here means the skill was not
-// honored and the agent loop was not truncated.
+// request.  The expected posture is zero native tool-call events: the
+// directive makes the model declare tool calls as JSON text in the first
+// turn instead of entering the platform agent loop.
 func logTools(sessionKey string, calls []upstream.AssistantToolCall) {
 	if len(calls) == 0 {
 		log.Printf("[TOOLS] key=%s tool_calls=none", sessionKey)
@@ -621,9 +621,9 @@ func logTools(sessionKey string, calls []upstream.AssistantToolCall) {
 }
 
 // parseToolCalls tries to interpret the model's text output as a tool_calls
-// JSON (mode B of the direct-reply skill).  It tolerates a surrounding code
+// JSON (the declared-tool protocol).  It tolerates a surrounding code
 // fence.  Returns nil when the text is not a tool_calls JSON, meaning the
-// model answered directly (mode A).
+// model answered directly.
 func parseToolCalls(text string) []openaiToolCall {
 	t := strings.TrimSpace(text)
 	t = strings.TrimPrefix(t, "```json")

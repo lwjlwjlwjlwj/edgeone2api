@@ -209,12 +209,11 @@ edgeone2api/
 │   ├── auth/pool_test.go         # 会话池单测（含并发扩容回归）
 │   ├── config/config.go          # 配置加载 + model_map + env override
 │   ├── upstream/client.go        # Harness RPC 客户端 + 浏览器指纹 + SSE 读取
-│   ├── upstream/skills.go        # direct-reply Skill 指令（Agent Loop 截断）
+│   ├── upstream/directive.go     # 工具定义注入指令（ToolForge 风格，首轮声明工具调用）
 │   ├── server/server.go          # OpenAI 兼容 handler + 流式/非流式 + 工具调用
 │   ├── server/tools.go           # 工具名翻译层（上游原生名 → 客户端声明名）
 │   ├── server/tools_test.go      # 翻译层单测
 │   └── toolcall/                 # 可选的工具调用中间件（独立部署）
-├── .trae/skills/direct-reply/    # direct-reply Skill 源文件
 ├── config.example.json
 ├── Dockerfile
 ├── docker-compose.yml

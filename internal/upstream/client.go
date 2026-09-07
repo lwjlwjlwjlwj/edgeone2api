@@ -509,7 +509,7 @@ func (c *Client) StartChat(ctx context.Context, sessionID, convID string, items 
 }
 
 func (c *Client) InitSession(ctx context.Context, sessionID, convID string) error {
-	cs, err := c.StartChat(ctx, sessionID, convID, DirectReplyInitPrompt())
+	cs, err := c.StartChat(ctx, sessionID, convID, InitPrompt())
 	if err != nil {
 		return err
 	}
