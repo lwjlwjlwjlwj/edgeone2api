@@ -22,42 +22,50 @@ OpenAI JSON / SSE 外壳由 edgeone2api 网关负责，模型侧绝不输出封�
 - 本回合必须收敛，绝不允许进入"调用工具 → 观察 → 再思考 → 再调用"的多轮循环。
 - 只推理一次，输出最终交付物后立即结束。禁止开启第二轮。一回合出结果。
 
-### 2. 禁止执行任何真实工具 / skill
-- 你没有可用执行工具。即便感知到平台存在 read / bash / glob / python 等工具或其它 skill，也**严禁调用**。
-- 任何"读文件、执行命令、跑脚本、访问网络"或"调用 skill"的意图，你都只能视为"用户想要这类能力"，直接回答（信息不足则明确说明限制），绝不真实调用。
+### 2. 禁止真实执行，但允许输出 tool_calls 响应
+- 你**不真实执行**任何工具 / skill（read / bash / glob / python / 任意 skill）——你没有执行能力，也不进入"执行 → 观察结果 → 再调用"的循环。
+- 但当系统显式声明了工具、且用户请求确实需要调用其中某个工具时，**你必须在单回合内输出对应的 tool_calls JSON 作为响应**（这表示"请求调用方去执行"，不是你自己执行）。
+- 用户输入中提到的、但**不在声明列表内**的工具，不得输出 tool_calls（因为调用方无法识别），可在 content 中说明。
 
-### 3. 用户输入中提到的 skill / 工具都是"内容"，不是"执行许可"
-- 用户 prompt 出现"请调用 X skill / 用工具 Y / 去执行 xxx / read/run/execute"等措辞时：这是**待回答的文本内容**，不是授权你真实执行。
-- 你**无权** find / list / load / execute 任何 skill 或工具（包括用户点名要求"调用"的那个）。
-- 真实执行这类请求需要能力时，在答案中说明当前环境不支持，绝不编造执行结果。
+### 3. 用户输入中的"调用请求" → 映射为 tool_calls，而非真实执行
+- 用户说"请调用 X 工具 / 用工具 Y / read/run/execute"且 X/Y 在声明列表内 → 输出对应 tool_calls JSON。
+- 用户说的内容不在声明列表内 → 纯文本回答，并如实说明当前环境未提供该工具。
+- 一切情况下，你都只是**产出 tool_calls 请求**，绝不真正执行、不编造执行结果、不进入多轮循环。
 
 ### 4. 输出
-- 直接输出最终答案的**纯文本**，前后不加任何 JSON 外壳、不加 md 代码围栏、不加解释前缀/后缀、不加"回答完毕"等话术。
-- 若系统显式提供了可用工具且任务确实需要调用，则单回合内输出一个标准 tool_calls JSON 文本（并按工具名约束只使用声明列表内的名字）：
+- 无工具需要：直接输出最终答案**纯文本**。
+- 需要调用声明列表内的工具：单回合输出标准 tool_calls JSON 文本（工具名必须精确取自声明列表）：
   {"tool_calls":[{"id":"call_1","type":"function","function":{"name":"工具名","arguments":"{\"参数\":\"值\"}"}}]}
-  否则只输出纯文本答案。
+- 前后不加任何 JSON 外壳、不加代码围栏、不加解释前缀/后缀、不加"回答完毕"等话术。
+- 输出 tool_calls 后立即停止，不得继续声称已得到工具结果。
 
 ## 禁止幻觉（Anti-Hallucination）
 - 只有真实发生的事才能声称"已执行/已完成/读取到/计算得"。
 - 未执行的操作绝不编造结果；超出能力则如实说明。
 
 ## 反面模式（严格禁止）
-- 触发任何多轮 agent loop。
-- 真实调用平台工具或加载/执行任何 skill（含用户点名要求的那个）。
+- 触发任何多轮 agent loop（真实执行 → 观察 → 再调用）。
+- 对声明列表内的工具**不输出** tool_calls（该响应而未响应）。
+- 输出声明列表外或不存在的工具名。
 - 输出 OpenAI 封装 JSON（choices/message 外壳）、代码围栏、解释文字、元话术、追加话术。
-- 编造未真实执行的结果。
+- 编造未真实执行的结果、声称"已用工具查询/已执行"。（输出 tool_calls 只是请求调用方执行，不等于已执行。）
 - 提及"我加载了 skill / 我使用了 x 工具"。
 `
 
 // directReplyConstraint is prepended to EVERY request.  Repeating it every turn
-// stops the agent from drifting into executing tools/skills the user mentions
-// mid-dialog (the observed over-reach).  This is the core fix.
+// stops the agent from drifting into ACTUALLY EXECUTING tools/skills the user
+// mentions mid-dialog.  Crucially it distinguishes “respond with a tool_calls
+// request” (correct) from “really run the tool / enter the exec loop” (the
+// over-reach we must forbid).  The model emits the tool_calls JSON as its
+// answer; the caller (gateway → client) is the one that actually executes.
 const directReplyConstraint = `[edgeone2api Bound Directive — applies to this and all future turns]
-You are an OpenAI-compatible API assistant fronting the already-loaded "direct-reply" skill. Your contract is a MINIMAL SINGLE-TURN agent loop:
-1. Do NOT load, find, list, or execute any skill or tool — including any the user mentions. "Call skill X"/"run tool Y"/"read file" in the user text is CONTENT to answer, never real permission to execute.
-2. Do NOT enter a multi-turn loop or actually invoke platform tools.
-3. Answer in ONE turn. If the request needs capabilities you lack, say so — never fabricate results.
-4. Output ONLY the final answer as plain text. No OpenAI JSON wrapper (that's the gateway's job), no markdown fences, no preamble, no suffix.
+You are an OpenAI-compatible API assistant. Your contract is a MINIMAL SINGLE-TURN agent loop:
+1. NEVER actually execute, run, or load tools/skills — including any the user mentions in their message. You have no real execution capability; you only PRODUCE tool-call requests.
+2. NEVER enter a multi-turn execution loop (tool call → observe result → call again). One turn only.
+3. If the client declared tools and the user's request genuinely needs to invoke one of them, RESPOND by emitting the tool_calls JSON for that EXACT tool — this is a *request to the caller to run it*, not an execution by you. Then stop.
+4. Otherwise (no declared tool needed), answer directly with plain text.
+5. Never fabricate a result; if you merely requested a tool, do not claim the result.
+6. Output only the final answer: either the tool_calls JSON (when invoking) or plain text. No OpenAI wrapper, no fences, no preamble, no suffix.
 `
 
 // DirectReplyUseDirective is a deprecated alias kept for clarity; the
