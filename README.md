@@ -170,7 +170,9 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 1. 客户端请求带 `tools`，网关把每个工具的定义（名字/描述/参数摘要）序列化进系统指令
    （`BuildDirective`，见 `internal/upstream/directive.go`），并声明「工具调用协议」：需要工具时，
-   整段回答必须是一个 `{"tool_calls":[...]}` JSON 文本（无代码围栏、无多余文字）
+   整段回答必须是一个 `{"tool_calls":[...]}` JSON 文本（无代码围栏、无多余文字）；
+   `arguments` 要求输出为 **JSON 对象**（`{"command":"..."}`，只需一层标准转义），避免深层
+   双重转义导致模型输出非法 JSON
 2. 上游首轮输出即为该 JSON 文本；网关在 `turn/end` 事件处**截断**，解析为标准 `tool_calls`
    （`finish_reason: "tool_calls"`，见 `internal/server/server.go`）——一次 LLM 调用即完成工具轮
 3. 客户端执行工具后，把结果以 `role: "tool"` 消息回传，网关以 `[Tool Result]` 文本透传给上游，
@@ -187,6 +189,12 @@ curl -s http://localhost:7863/v1/chat/completions \
 > **兼容兜底**：若模型仍输出上游裸名（`read`/`bash`/`glob`），内置**工具名翻译层**
 > （`translateToolCalls`，见 `internal/server/tools.go`）按别名映射表重写为客户端声明名
 > （`read` → `read_file`），无法映射的名字丢弃并告警。
+
+> **解析健壮性**（`parseToolCalls`，见 `internal/server/server.go`）：网关对模型输出做多层容错——
+> ① `arguments` 兼容 object 与 JSON 字符串两种形态；② 对 `"arguments":"{...}"` 这类「对象被外层
+> 引号包裹」的畸形输出自动剥壳修复；③ 极端情况下（引号转义丢失无法确定性修复）触发一次**纠错重试**，
+> 向会话发送协议纠错指令让模型重新输出 tool_calls；流式请求中疑似 JSON 的应答会被暂存到回合结束再
+> 决策，避免把损坏的工具调用 JSON 当成普通文本流给客户端。
 
 ### 一次对话时序
 

@@ -57,9 +57,10 @@ You are an OpenAI-compatible API assistant. Answer the user's question directly 
 	}
 	b.WriteString("[Tool Calling Protocol]\n")
 	b.WriteString("When the user's request requires one of the available tools, your ENTIRE answer must be a single JSON object and nothing else (no code fence, no explanation, no preamble, no suffix):\n")
-	b.WriteString(`{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"<exact tool name>","arguments":"<JSON-string of parameters>"}}]}` + "\n")
+	b.WriteString(`{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"<exact tool name>","arguments":{"<parameter name>":<JSON value>}}}]}` + "\n")
 	b.WriteString("- The tool name MUST be exactly one of the names listed above; never invent or translate names.\n")
-	b.WriteString("- arguments is a JSON-encoded string matching the tool's parameters (escape inner quotes).\n")
+	b.WriteString(`- arguments is a JSON OBJECT: one key per parameter, values are ordinary JSON. For string parameters keep an ordinary JSON string (escape quotes as \" and backslashes as \\). NEVER wrap arguments as a JSON-encoded string.` + "\n")
+	b.WriteString(`- Example: {"tool_calls":[{"id":"call_1","type":"function","function":{"name":"exec","arguments":{"command":"echo \"hi\""}}}]}` + "\n")
 	b.WriteString("- Emitting tool_calls is a REQUEST for the caller to execute; you will receive the result in a later message. Never claim a result you do not have.\n")
 	b.WriteString("- Never emit calls for tools not listed above (e.g. mcp__edgeone__*, bash, read, glob, python, skill).\n")
 	b.WriteString("When no tool is needed, answer directly with plain text and be genuinely helpful.\n---")

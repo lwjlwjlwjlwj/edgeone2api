@@ -313,10 +313,26 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 		var sb strings.Builder
 		var result upstream.ChatResult
 		var streamErr error
-		// nativeToolCalls tracks whether upstream emitted real tool-call events
-		// mid-stream (vs. the mode-B text protocol parsed after the turn).
+		// nativeToolCall tracks whether upstream emitted real tool-call events
+		// mid-stream (vs. the text-protocol tool_calls JSON parsed after the turn).
 		nativeToolCall := false
 		toolSeen := make(map[int]bool) // index -> name delta sent
+		// With tools declared, JSON-looking content is held back until the
+		// turn ends: a malformed tool_calls JSON is repaired or reprised
+		// instead of being streamed to the client as broken text.  Plain
+		// prose diverges immediately and streams live as usual.
+		holdContent := toolsJSON != ""
+		live := false
+		var held strings.Builder
+
+		emitText := func(text string) {
+			if text == "" {
+				return
+			}
+			emitSSE(w, chatID, model, created, map[string]any{"content": text})
+			flusher.Flush()
+		}
+
 		result, streamErr = session.Client.StreamEvents(ctx, cs, func(chunk upstream.AssistantChunk) {
 			if chunk.IsDone {
 				return // finish chunk is emitted after StreamEvents returns
@@ -325,7 +341,19 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 			delta := map[string]any{}
 			if chunk.Text != "" {
 				sb.WriteString(chunk.Text)
-				delta["content"] = chunk.Text
+				if holdContent && !live {
+					candidate := held.String() + chunk.Text
+					if jsonish(candidate) && held.Len() <= maxToolCallBuf {
+						held.WriteString(chunk.Text)
+					} else {
+						live = true
+						emitText(held.String())
+						held.Reset()
+						emitText(chunk.Text)
+					}
+				} else {
+					emitText(chunk.Text)
+				}
 			}
 			if chunk.Reasoning != "" {
 				delta["reasoning_content"] = chunk.Reasoning
@@ -333,6 +361,11 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 			if chunk.ToolCall != nil {
 				tc := chunk.ToolCall
 				nativeToolCall = true
+				if holdContent && !live {
+					live = true
+					emitText(held.String())
+					held.Reset()
+				}
 				if tc.Name != "" && !toolSeen[tc.Index] {
 					toolSeen[tc.Index] = true
 					delta["role"] = "assistant"
@@ -367,15 +400,23 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 			success = false
 		} else {
 			success = true
-			if sessionKey != "" {
-				s.pool.AppendHistory(sessionKey, session.SessionID, userText, sb.String())
-			}
 			if nativeToolCall || len(result.ToolCalls) > 0 {
 				finishReason = "tool_calls"
-			} else if calls := parseToolCalls(sb.String()); calls != nil {
-				emitToolCallsSSE(w, chatID, model, created, translateToolCalls(calls, declared))
+			} else if calls := translateToolCalls(parseToolCalls(held.String()), declared); calls != nil {
+				emitToolCallsSSE(w, chatID, model, created, calls)
 				flusher.Flush()
 				finishReason = "tool_calls"
+			} else if calls := s.retryToolCallsOnce(ctx, session, toolsJSON, declared, held.String()); calls != nil {
+				emitToolCallsSSE(w, chatID, model, created, calls)
+				flusher.Flush()
+				finishReason = "tool_calls"
+			} else if held.Len() > 0 {
+				// held content was not a tool declaration after all — stream it now
+				emitText(held.String())
+				held.Reset()
+			}
+			if sessionKey != "" {
+				s.pool.AppendHistory(sessionKey, session.SessionID, userText, sb.String())
 			}
 		}
 
@@ -445,6 +486,10 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 		msg["tool_calls"] = calls
 		finish = "tool_calls"
 	} else if calls := translateToolCalls(parseToolCalls(result.Text), declared); calls != nil {
+		msg["content"] = nil
+		msg["tool_calls"] = calls
+		finish = "tool_calls"
+	} else if calls := s.retryToolCallsOnce(ctx, session, toolsJSON, declared, result.Text); calls != nil {
 		msg["content"] = nil
 		msg["tool_calls"] = calls
 		finish = "tool_calls"
@@ -620,25 +665,91 @@ func logTools(sessionKey string, calls []upstream.AssistantToolCall) {
 	}
 }
 
+// maxToolCallBuf caps how much JSON-looking content is held back before it is
+// streamed live.  Tool-call declarations are short, so this is generous; a
+// genuinely long final answer crossing the limit is flushed and streamed.
+const maxToolCallBuf = 16 * 1024
+
+// retryToolCallsOnce asks the session for one corrected tool_calls JSON after
+// the model's first attempt failed to parse (e.g. an unescaped arguments
+// field).  It only fires when tools were declared and the broken text looked
+// like a JSON document; returns nil otherwise.  This is the last-resort
+// recovery on top of the tolerant parser.
+func (s *Server) retryToolCallsOnce(ctx context.Context, session *auth.Session, toolsJSON string, declared declaredToolSet, broken string) []openaiToolCall {
+	if toolsJSON == "" || session == nil || !jsonish(broken) {
+		return nil
+	}
+	correction := "[Protocol Error Recovery]\n" +
+		"Your previous answer did not follow the Tool Calling Protocol: it was not valid JSON (usually an unescaped arguments field or a wrong structure).\n" +
+		"Output ONLY the corrected tool_calls JSON object now, and nothing else (no code fence, no explanation, no preamble).\n" +
+		`Remember: arguments is a JSON OBJECT (one key per parameter, values are ordinary JSON), never a JSON-encoded string; inside string values escape quotes as \" and backslashes as \\.` + "\n" +
+		"Previous broken answer for reference (truncated):\n" + truncateBroken(broken)
+	items := []upstream.ContentItem{{Type: "text", Text: correction}}
+	cs, err := session.Client.StartChat(ctx, session.SessionID, session.ConversationID, items)
+	if err != nil {
+		log.Printf("[RETRY] corrective prompt failed: %v", err)
+		return nil
+	}
+	res, err := session.Client.StreamEvents(ctx, cs, nil)
+	if err != nil {
+		log.Printf("[RETRY] corrective turn failed: %v", err)
+		return nil
+	}
+	return translateToolCalls(parseToolCalls(res.Text), declared)
+}
+
+func truncateBroken(s string) string {
+	const maxLen = 2000
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
 // parseToolCalls tries to interpret the model's text output as a tool_calls
 // JSON (the declared-tool protocol).  It tolerates a surrounding code
-// fence.  Returns nil when the text is not a tool_calls JSON, meaning the
-// model answered directly.
+// fence, both the object-form arguments (preferred protocol) and the legacy
+// JSON-string form, and repairs the malformed "arguments":"{...}" shape the
+// model occasionally emits.  Returns nil when the text is not a tool_calls
+// JSON, meaning the model answered directly.
 func parseToolCalls(text string) []openaiToolCall {
+	t := stripJSONFence(text)
+	if t == "" {
+		return nil
+	}
+	if calls := tryParseToolCalls(t); calls != nil {
+		return calls
+	}
+	if repaired := unwrapWrappedArguments(t); repaired != t {
+		if calls := tryParseToolCalls(repaired); calls != nil {
+			return calls
+		}
+	}
+	return nil
+}
+
+// parsedToolCallCandidate mirrors the model-emitted tool_calls JSON with a
+// flexible arguments field (object or JSON-string).
+type parsedToolCallCandidate struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	} `json:"function"`
+}
+
+func stripJSONFence(text string) string {
 	t := strings.TrimSpace(text)
 	t = strings.TrimPrefix(t, "```json")
 	t = strings.TrimPrefix(t, "```")
 	t = strings.TrimSuffix(t, "```")
-	t = strings.TrimSpace(t)
+	return strings.TrimSpace(t)
+}
+
+func tryParseToolCalls(t string) []openaiToolCall {
 	var parsed struct {
-		ToolCalls []struct {
-			ID       string `json:"id"`
-			Type     string `json:"type"`
-			Function struct {
-				Name      string `json:"name"`
-				Arguments string `json:"arguments"`
-			} `json:"function"`
-		} `json:"tool_calls"`
+		ToolCalls []parsedToolCallCandidate `json:"tool_calls"`
 	}
 	if err := json.Unmarshal([]byte(t), &parsed); err != nil {
 		return nil
@@ -648,6 +759,13 @@ func parseToolCalls(text string) []openaiToolCall {
 	}
 	calls := make([]openaiToolCall, 0, len(parsed.ToolCalls))
 	for i, c := range parsed.ToolCalls {
+		if c.Function.Name == "" {
+			continue
+		}
+		args, err := normalizeToolArguments(c.Function.Arguments)
+		if err != nil {
+			return nil
+		}
 		typ := c.Type
 		if typ == "" {
 			typ = "function"
@@ -661,11 +779,133 @@ func parseToolCalls(text string) []openaiToolCall {
 			Type: typ,
 			Function: openaiToolCallFn{
 				Name:      c.Function.Name,
-				Arguments: c.Function.Arguments,
+				Arguments: args,
 			},
 		})
 	}
 	return calls
+}
+
+// normalizeToolArguments converts the model-emitted arguments value into the
+// client-facing JSON string.  Object form (preferred protocol) is
+// compact-marshaled; string form (legacy) is passed through untouched.
+func normalizeToolArguments(raw json.RawMessage) (string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "{}", nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s, nil
+	}
+	var obj any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return "", err
+	}
+	b, err := json.Marshal(obj)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// unwrapWrappedArguments repairs the malformed shape the model occasionally
+// emits for the arguments field:
+//
+//	"arguments":"{...valid json object...}"
+//
+// The wrapping quotes are stripped so the object parses as a real JSON value.
+// The inner object must already be well-formed; anything else is left as-is.
+// Returns the repaired text, or the input unchanged when nothing matched.
+func unwrapWrappedArguments(text string) string {
+	out := text
+	offset := 0
+	const key = `"arguments"`
+	for {
+		idx := strings.Index(out[offset:], key)
+		if idx < 0 {
+			break
+		}
+		idx += offset
+		i := skipJSONSpace(out, idx+len(key))
+		if i >= len(out) || out[i] != ':' {
+			offset = idx + len(key)
+			continue
+		}
+		j := skipJSONSpace(out, i+1)
+		if j+1 >= len(out) || out[j] != '"' || out[j+1] != '{' {
+			offset = j + 1
+			continue
+		}
+		end := findJSONObjectEnd(out, j+1)
+		if end <= j+1 {
+			offset = j + 1
+			continue
+		}
+		k := skipJSONSpace(out, end+1)
+		if k >= len(out) || out[k] != '"' {
+			offset = k
+			continue
+		}
+		// strip the wrapping quotes: out[j] is the opening quote, out[k] the closing one
+		out = out[:j] + out[j+1:k] + out[k+1:]
+		offset = j
+	}
+	return out
+}
+
+func isJSONSpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+}
+
+func skipJSONSpace(s string, i int) int {
+	for i < len(s) && isJSONSpace(s[i]) {
+		i++
+	}
+	return i
+}
+
+// findJSONObjectEnd returns the index of the '}' matching the '{' at start,
+// or -1 when the object is unbalanced.  JSON-aware: quoted strings and their
+// escapes are skipped, so braces inside string values do not count.
+func findJSONObjectEnd(s string, start int) int {
+	depth := 0
+	inStr := false
+	esc := false
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			if esc {
+				esc = false
+				continue
+			}
+			switch c {
+			case '\\':
+				esc = true
+			case '"':
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// jsonish reports whether the text looks like a JSON document declaration
+// (after removing a code fence), i.e. starts with '{' or '['.
+func jsonish(text string) bool {
+	t := strings.TrimSpace(stripJSONFence(text))
+	return strings.HasPrefix(t, "{") || strings.HasPrefix(t, "[")
 }
 
 // --- SSE helpers ---
