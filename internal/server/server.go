@@ -10,11 +10,13 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
 	"edgeone2api/internal/auth"
 	"edgeone2api/internal/config"
+	"edgeone2api/internal/toolcall"
 	"edgeone2api/internal/upstream"
 )
 
@@ -25,10 +27,12 @@ type Server struct {
 	models   []string
 	timeout  time.Duration
 	modelMap map[string]config.ModelMapping
+	tc       *toolcall.Client
 }
 
-// New creates a new server
-func New(pool *auth.Pool, apiKey string, models []string, timeout time.Duration, modelMap map[string]config.ModelMapping) *Server {
+// New creates a new server.  tc is the tool-call sidecar client (may be nil
+// for a gateway that never declares tools).
+func New(pool *auth.Pool, apiKey string, models []string, timeout time.Duration, modelMap map[string]config.ModelMapping, tc *toolcall.Client) *Server {
 	if len(models) == 0 {
 		models = []string{"@makers/deepseek-v4-flash", "@makers/deepseek-v4-pro"}
 	}
@@ -41,6 +45,7 @@ func New(pool *auth.Pool, apiKey string, models []string, timeout time.Duration,
 		models:   models,
 		timeout:  timeout,
 		modelMap: modelMap,
+		tc:       tc,
 	}
 }
 
@@ -271,7 +276,12 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 
 	// Try once with the current session; if quota error, retry with a fresh one.
 	for attempt := 0; attempt < 2; attempt++ {
-		items := s.buildItems(session, sessionKey, msgs, toolsJSON)
+		items, err := s.buildItems(ctx, session, sessionKey, msgs, toolsJSON)
+		if err != nil {
+			release(false)
+			writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": "tool pipeline error: " + err.Error(), "type": "upstream_error"}})
+			return
+		}
 		cs, err := session.Client.StartChat(ctx, session.SessionID, session.ConversationID, items)
 		if err != nil {
 			if upstream.IsQuotaError(err) || upstream.IsSessionNotFound(err) {
@@ -314,16 +324,16 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 		var result upstream.ChatResult
 		var streamErr error
 		// nativeToolCall tracks whether upstream emitted real tool-call events
-		// mid-stream (vs. the text-protocol tool_calls JSON parsed after the turn).
+		// mid-stream (vs. the text-protocol tool_calls parsed after the turn).
 		nativeToolCall := false
 		toolSeen := make(map[int]bool) // index -> name delta sent
-		// With tools declared, JSON-looking content is held back until the
-		// turn ends: a malformed tool_calls JSON is repaired or reprised
-		// instead of being streamed to the client as broken text.  Plain
-		// prose diverges immediately and streams live as usual.
+		// With tools declared, protocol envelopes (XYML/QNML markup, legacy
+		// tool_calls JSON) are siphoned off the live stream and held until the
+		// turn ends, where the sidecar parses them into tool_calls (with
+		// truncation / parse-error recovery).  Plain prose streams live, so a
+		// normal chat answer is never delayed.
 		holdContent := toolsJSON != ""
-		live := false
-		var held strings.Builder
+		sieve := newStreamSieve()
 
 		emitText := func(text string) {
 			if text == "" {
@@ -341,15 +351,9 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 			delta := map[string]any{}
 			if chunk.Text != "" {
 				sb.WriteString(chunk.Text)
-				if holdContent && !live {
-					candidate := held.String() + chunk.Text
-					if jsonish(candidate) && held.Len() <= maxToolCallBuf {
-						held.WriteString(chunk.Text)
-					} else {
-						live = true
-						emitText(held.String())
-						held.Reset()
-						emitText(chunk.Text)
+				if holdContent {
+					if emitLive := sieve.feed(chunk.Text); emitLive != "" {
+						emitText(emitLive)
 					}
 				} else {
 					emitText(chunk.Text)
@@ -361,10 +365,13 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 			if chunk.ToolCall != nil {
 				tc := chunk.ToolCall
 				nativeToolCall = true
-				if holdContent && !live {
-					live = true
-					emitText(held.String())
-					held.Reset()
+				if holdContent {
+					// Real tool-call events take over the turn: any text the
+					// sieve still holds (prose tail or an unparsed envelope)
+					// is drained to the client as content.
+					if text := sieve.drainForNativeTool(); text != "" {
+						emitText(text)
+					}
 				}
 				if tc.Name != "" && !toolSeen[tc.Index] {
 					toolSeen[tc.Index] = true
@@ -402,18 +409,19 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 			success = true
 			if nativeToolCall || len(result.ToolCalls) > 0 {
 				finishReason = "tool_calls"
-			} else if calls := translateToolCalls(parseToolCalls(held.String()), declared); calls != nil {
-				emitToolCallsSSE(w, chatID, model, created, calls)
-				flusher.Flush()
-				finishReason = "tool_calls"
-			} else if calls := s.retryToolCallsOnce(ctx, session, toolsJSON, declared, held.String()); calls != nil {
-				emitToolCallsSSE(w, chatID, model, created, calls)
-				flusher.Flush()
-				finishReason = "tool_calls"
-			} else if held.Len() > 0 {
-				// held content was not a tool declaration after all — stream it now
-				emitText(held.String())
-				held.Reset()
+			} else {
+				heldText, rest := sieve.flush()
+				if rest != "" {
+					emitText(rest)
+				}
+				if calls, ok := s.resolveToolCalls(ctx, session, toolsJSON, declared, heldText); ok {
+					emitToolCallsSSE(w, chatID, model, created, calls)
+					flusher.Flush()
+					finishReason = "tool_calls"
+				} else if heldText != "" {
+					// held content was not a tool declaration after all — stream it now
+					emitText(heldText)
+				}
 			}
 			if sessionKey != "" {
 				s.pool.AppendHistory(sessionKey, session.SessionID, userText, sb.String())
@@ -437,7 +445,12 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 
 	for attempt := 0; attempt < 2; attempt++ {
 		var cs *upstream.ChatStream
-		items := s.buildItems(session, sessionKey, msgs, toolsJSON)
+		items, buildErr := s.buildItems(ctx, session, sessionKey, msgs, toolsJSON)
+		if buildErr != nil {
+			release(false)
+			writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": "tool pipeline error: " + buildErr.Error(), "type": "upstream_error"}})
+			return
+		}
 		cs, err = session.Client.StartChat(ctx, session.SessionID, session.ConversationID, items)
 		if err != nil {
 			if upstream.IsQuotaError(err) || upstream.IsSessionNotFound(err) {
@@ -478,18 +491,15 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 	}
 	finish := "stop"
 	// Prefer the upstream-native tool calls (real tool-call events), falling
-	// back to the declared-tool JSON text protocol when the model emitted a
-	// tool_calls JSON as plain text instead.  Both paths go through the tool
-	// translation layer so tool names match the client's declared set.
+	// back to the text-protocol tool calls the model emitted in its answer.
+	// Both paths go through the translation layer so tool names match the
+	// client's declared set.  When the text protocol fails to parse, the
+	// sidecar recovery path issues one corrective turn before giving up.
 	if calls := translateToolCalls(toOpenAIToolCalls(result.ToolCalls), declared); len(calls) > 0 {
 		msg["content"] = nil
 		msg["tool_calls"] = calls
 		finish = "tool_calls"
-	} else if calls := translateToolCalls(parseToolCalls(result.Text), declared); calls != nil {
-		msg["content"] = nil
-		msg["tool_calls"] = calls
-		finish = "tool_calls"
-	} else if calls := s.retryToolCallsOnce(ctx, session, toolsJSON, declared, result.Text); calls != nil {
+	} else if calls, ok := s.resolveToolCalls(ctx, session, toolsJSON, declared, result.Text); ok {
 		msg["content"] = nil
 		msg["tool_calls"] = calls
 		finish = "tool_calls"
@@ -521,19 +531,58 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 
 // --- Message conversion ---
 
-// buildItems assembles the prompt for a session: the tool-definition
-// directive (with declared tools when any), an optional cache-hit replay of
-// the previous dialog history, then the request messages.  Replay is
+// buildItems assembles the prompt for a session.  With declared tools the
+// XYML instruction block (plus the detected CLI tool-profile block) becomes
+// the system directive and the full history — including previous assistant
+// tool_calls and tool results — is flattened to plain chat text by the
+// sidecar, so the plain-LLM upstream never sees OpenAI tool-call structures.
+// Without tools the request is a straightforward chat (native directive +
+// converted messages).  A cache-hit replay of the previous dialog is
 // recomputed per session so a fresh session created by a quota retry inherits
 // the cached context automatically.
-func (s *Server) buildItems(session *auth.Session, sessionKey string, msgs []openaiMessage, toolsJSON string) []upstream.ContentItem {
-	items := []upstream.ContentItem{{Type: "text", Text: upstream.BuildDirective(toolsJSON)}}
+func (s *Server) buildItems(ctx context.Context, session *auth.Session, sessionKey string, msgs []openaiMessage, toolsJSON string) ([]upstream.ContentItem, error) {
+	if toolsJSON == "" {
+		items := []upstream.ContentItem{{Type: "text", Text: upstream.BuildDirective("")}}
+		if sessionKey != "" {
+			if replay := s.pool.ReplayHistory(sessionKey, session.SessionID); len(replay) > 0 {
+				items = append(items, upstream.ContentItem{Type: "text", Text: formatReplay(replay)})
+			}
+		}
+		return append(items, convertMessages(msgs)...), nil
+	}
+
+	if s.tc == nil {
+		return nil, fmt.Errorf("tool sidecar unavailable")
+	}
+	ins, err := s.tc.BuildInstructions(ctx, []byte(toolsJSON))
+	if err != nil {
+		return nil, err
+	}
+	directive := ins.Instructions
+	if ins.Profile.Block != "" {
+		directive = directive + "\n\n" + ins.Profile.Block
+	}
+	items := []upstream.ContentItem{{Type: "text", Text: directive}}
 	if sessionKey != "" {
 		if replay := s.pool.ReplayHistory(sessionKey, session.SessionID); len(replay) > 0 {
 			items = append(items, upstream.ContentItem{Type: "text", Text: formatReplay(replay)})
 		}
 	}
-	return append(items, convertMessages(msgs)...)
+	msgsJSON, err := json.Marshal(msgs)
+	if err != nil {
+		return nil, fmt.Errorf("marshal messages: %w", err)
+	}
+	rendered, err := s.tc.RenderHistory(ctx, msgsJSON)
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range rendered {
+		if strings.TrimSpace(item.Content) == "" {
+			continue
+		}
+		items = append(items, upstream.ContentItem{Type: "text", Text: item.Content})
+	}
+	return items, nil
 }
 
 func formatReplay(turns []auth.DialogTurn) string {
@@ -665,247 +714,179 @@ func logTools(sessionKey string, calls []upstream.AssistantToolCall) {
 	}
 }
 
-// maxToolCallBuf caps how much JSON-looking content is held back before it is
-// streamed live.  Tool-call declarations are short, so this is generous; a
-// genuinely long final answer crossing the limit is flushed and streamed.
-const maxToolCallBuf = 16 * 1024
-
-// retryToolCallsOnce asks the session for one corrected tool_calls JSON after
-// the model's first attempt failed to parse (e.g. an unescaped arguments
-// field).  It only fires when tools were declared and the broken text looked
-// like a JSON document; returns nil otherwise.  This is the last-resort
-// recovery on top of the tolerant parser.
-func (s *Server) retryToolCallsOnce(ctx context.Context, session *auth.Session, toolsJSON string, declared declaredToolSet, broken string) []openaiToolCall {
-	if toolsJSON == "" || session == nil || !jsonish(broken) {
-		return nil
+// resolveToolCalls turns the model's text answer into client-facing tool
+// calls, delegating to the tool sidecar (the ported toolforge engine):
+//
+//  1. parse the output with the full xyml engine (markup/XML/JSON/text-KV,
+//     CDATA-aware) and translate native names to the client's declared set;
+//  2. when nothing parses, ask the sidecar whether the output was truncated
+//     or merely unparseable; if so, run ONE corrective turn (toolforge
+//     recovery) and re-parse.
+//
+// ok is false when the text carries no tool-call attempt at all, meaning the
+// caller should serve it as plain content.
+func (s *Server) resolveToolCalls(ctx context.Context, session *auth.Session, toolsJSON string, declared declaredToolSet, text string) ([]openaiToolCall, bool) {
+	if toolsJSON == "" || s.tc == nil || session == nil {
+		return nil, false
 	}
-	correction := "[Protocol Error Recovery]\n" +
-		"Your previous answer did not follow the Tool Calling Protocol: it was not valid JSON (usually an unescaped arguments field or a wrong structure).\n" +
-		"Output ONLY the corrected tool_calls JSON object now, and nothing else (no code fence, no explanation, no preamble).\n" +
-		`Remember: arguments is a JSON OBJECT (one key per parameter, values are ordinary JSON), never a JSON-encoded string; inside string values escape quotes as \" and backslashes as \\.` + "\n" +
-		"Previous broken answer for reference (truncated):\n" + truncateBroken(broken)
-	items := []upstream.ContentItem{{Type: "text", Text: correction}}
+	if strings.TrimSpace(text) == "" {
+		return nil, false
+	}
+	calls, reason, err := s.tc.RecoverToolCalls(ctx, text, []byte(toolsJSON))
+	if err != nil {
+		log.Printf("[TOOLCALL] parse failed: %v", err)
+		return nil, false
+	}
+	if len(calls) > 0 {
+		return translateToolCalls(sidecarCallsToOpenAI(calls), declared), true
+	}
+	if reason == "" {
+		// output carries no tool-call attempt at all
+		return nil, false
+	}
+	retry, err := s.tc.RetryMessage(ctx, text, reason)
+	if err != nil || retry == "" {
+		log.Printf("[TOOLCALL] retry message failed: %v", err)
+		return nil, false
+	}
+	log.Printf("[TOOLCALL] recovery reason=%s — issuing corrective turn", reason)
+	items := []upstream.ContentItem{{Type: "text", Text: retry}}
 	cs, err := session.Client.StartChat(ctx, session.SessionID, session.ConversationID, items)
 	if err != nil {
-		log.Printf("[RETRY] corrective prompt failed: %v", err)
-		return nil
+		log.Printf("[TOOLCALL] corrective turn start failed: %v", err)
+		return nil, false
 	}
 	res, err := session.Client.StreamEvents(ctx, cs, nil)
 	if err != nil {
-		log.Printf("[RETRY] corrective turn failed: %v", err)
-		return nil
+		log.Printf("[TOOLCALL] corrective turn failed: %v", err)
+		return nil, false
 	}
-	return translateToolCalls(parseToolCalls(res.Text), declared)
+	fixed, err := s.tc.ParseToolCalls(ctx, res.Text, []byte(toolsJSON))
+	if err != nil || len(fixed) == 0 {
+		log.Printf("[TOOLCALL] corrective turn still unparseable (%v, %d calls)", err, len(fixed))
+		return nil, false
+	}
+	return translateToolCalls(sidecarCallsToOpenAI(fixed), declared), true
 }
 
-func truncateBroken(s string) string {
-	const maxLen = 2000
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
-}
-
-// parseToolCalls tries to interpret the model's text output as a tool_calls
-// JSON (the declared-tool protocol).  It tolerates a surrounding code
-// fence, both the object-form arguments (preferred protocol) and the legacy
-// JSON-string form, and repairs the malformed "arguments":"{...}" shape the
-// model occasionally emits.  Returns nil when the text is not a tool_calls
-// JSON, meaning the model answered directly.
-func parseToolCalls(text string) []openaiToolCall {
-	t := stripJSONFence(text)
-	if t == "" {
-		return nil
-	}
-	if calls := tryParseToolCalls(t); calls != nil {
-		return calls
-	}
-	if repaired := unwrapWrappedArguments(t); repaired != t {
-		if calls := tryParseToolCalls(repaired); calls != nil {
-			return calls
-		}
-	}
-	return nil
-}
-
-// parsedToolCallCandidate mirrors the model-emitted tool_calls JSON with a
-// flexible arguments field (object or JSON-string).
-type parsedToolCallCandidate struct {
-	ID       string `json:"id"`
-	Type     string `json:"type"`
-	Function struct {
-		Name      string          `json:"name"`
-		Arguments json.RawMessage `json:"arguments"`
-	} `json:"function"`
-}
-
-func stripJSONFence(text string) string {
-	t := strings.TrimSpace(text)
-	t = strings.TrimPrefix(t, "```json")
-	t = strings.TrimPrefix(t, "```")
-	t = strings.TrimSuffix(t, "```")
-	return strings.TrimSpace(t)
-}
-
-func tryParseToolCalls(t string) []openaiToolCall {
-	var parsed struct {
-		ToolCalls []parsedToolCallCandidate `json:"tool_calls"`
-	}
-	if err := json.Unmarshal([]byte(t), &parsed); err != nil {
-		return nil
-	}
-	if len(parsed.ToolCalls) == 0 {
-		return nil
-	}
-	calls := make([]openaiToolCall, 0, len(parsed.ToolCalls))
-	for i, c := range parsed.ToolCalls {
-		if c.Function.Name == "" {
-			continue
-		}
-		args, err := normalizeToolArguments(c.Function.Arguments)
-		if err != nil {
-			return nil
-		}
-		typ := c.Type
-		if typ == "" {
-			typ = "function"
-		}
-		id := c.ID
-		if id == "" {
-			id = fmt.Sprintf("call_%s_%d", randHex(6), i)
-		}
-		calls = append(calls, openaiToolCall{
-			ID:   id,
-			Type: typ,
+// sidecarCallsToOpenAI adapts sidecar tool calls (OpenAI JSON shape) into the
+// server's native openaiToolCall value type.
+func sidecarCallsToOpenAI(calls []toolcall.ToolCall) []openaiToolCall {
+	out := make([]openaiToolCall, 0, len(calls))
+	for _, c := range calls {
+		out = append(out, openaiToolCall{
+			ID:   c.ID,
+			Type: c.Type,
 			Function: openaiToolCallFn{
 				Name:      c.Function.Name,
-				Arguments: args,
+				Arguments: c.Function.Arguments,
 			},
 		})
-	}
-	return calls
-}
-
-// normalizeToolArguments converts the model-emitted arguments value into the
-// client-facing JSON string.  Object form (preferred protocol) is
-// compact-marshaled; string form (legacy) is passed through untouched.
-func normalizeToolArguments(raw json.RawMessage) (string, error) {
-	if len(raw) == 0 || string(raw) == "null" {
-		return "{}", nil
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		return s, nil
-	}
-	var obj any
-	if err := json.Unmarshal(raw, &obj); err != nil {
-		return "", err
-	}
-	b, err := json.Marshal(obj)
-	if err != nil {
-		return "", err
-	}
-	return string(b), nil
-}
-
-// unwrapWrappedArguments repairs the malformed shape the model occasionally
-// emits for the arguments field:
-//
-//	"arguments":"{...valid json object...}"
-//
-// The wrapping quotes are stripped so the object parses as a real JSON value.
-// The inner object must already be well-formed; anything else is left as-is.
-// Returns the repaired text, or the input unchanged when nothing matched.
-func unwrapWrappedArguments(text string) string {
-	out := text
-	offset := 0
-	const key = `"arguments"`
-	for {
-		idx := strings.Index(out[offset:], key)
-		if idx < 0 {
-			break
-		}
-		idx += offset
-		i := skipJSONSpace(out, idx+len(key))
-		if i >= len(out) || out[i] != ':' {
-			offset = idx + len(key)
-			continue
-		}
-		j := skipJSONSpace(out, i+1)
-		if j+1 >= len(out) || out[j] != '"' || out[j+1] != '{' {
-			offset = j + 1
-			continue
-		}
-		end := findJSONObjectEnd(out, j+1)
-		if end <= j+1 {
-			offset = j + 1
-			continue
-		}
-		k := skipJSONSpace(out, end+1)
-		if k >= len(out) || out[k] != '"' {
-			offset = k
-			continue
-		}
-		// strip the wrapping quotes: out[j] is the opening quote, out[k] the closing one
-		out = out[:j] + out[j+1:k] + out[k+1:]
-		offset = j
 	}
 	return out
 }
 
-func isJSONSpace(b byte) bool {
-	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+// streamSieve mirrors toolforge's ToolSieve: it separates plain prose
+// (streamed live) from tool-call envelopes (held until the turn ends, where
+// the sidecar parses them).  A small look-back tail keeps a protocol marker
+// split across chunk boundaries from leaking into the client stream.
+type streamSieve struct {
+	pending   strings.Builder
+	held      strings.Builder
+	capturing bool
 }
 
-func skipJSONSpace(s string, i int) int {
-	for i < len(s) && isJSONSpace(s[i]) {
-		i++
+// sieveTail is the look-back window for detecting a late protocol marker.
+const sieveTail = 256
+
+func newStreamSieve() *streamSieve {
+	return &streamSieve{}
+}
+
+// feed consumes one text chunk and returns the portion that should be
+// streamed to the client right now ("" while the siever is holding an
+// envelope).  Prose always streams; when a tool marker appears the siever
+// switches to capture mode and holds everything from the marker (or its
+// leading code fence) onward.
+func (s *streamSieve) feed(chunk string) string {
+	if s.capturing {
+		s.held.WriteString(chunk)
+		return ""
 	}
-	return i
+	s.pending.WriteString(chunk)
+	candidate := s.pending.String()
+	if m := firstToolMarker(candidate); m >= 0 {
+		s.held.WriteString(candidate[m:])
+		s.pending.Reset()
+		s.capturing = true
+		return candidate[:m]
+	}
+	if len(candidate) > sieveTail {
+		safe := candidate[:len(candidate)-sieveTail]
+		rest := candidate[len(candidate)-sieveTail:]
+		s.pending.Reset()
+		s.pending.WriteString(rest)
+		return safe
+	}
+	return ""
 }
 
-// findJSONObjectEnd returns the index of the '}' matching the '{' at start,
-// or -1 when the object is unbalanced.  JSON-aware: quoted strings and their
-// escapes are skipped, so braces inside string values do not count.
-func findJSONObjectEnd(s string, start int) int {
-	depth := 0
-	inStr := false
-	esc := false
-	for i := start; i < len(s); i++ {
-		c := s[i]
-		if inStr {
-			if esc {
-				esc = false
-				continue
+// flush ends the turn: it returns the held envelope (to be parsed as tool
+// calls) and any remaining buffered prose (to be streamed as content).
+func (s *streamSieve) flush() (held string, rest string) {
+	if s.capturing {
+		s.capturing = false
+		return s.held.String() + s.pending.String(), ""
+	}
+	rest = s.pending.String()
+	s.pending.Reset()
+	return "", rest
+}
+
+// drainForNativeTool drains whatever the sieve is still holding so the turn
+// can switch back to native upstream tool-call events.
+func (s *streamSieve) drainForNativeTool() string {
+	var out strings.Builder
+	if s.capturing {
+		out.WriteString(s.held.String())
+		s.held.Reset()
+		s.capturing = false
+	}
+	out.WriteString(s.pending.String())
+	s.pending.Reset()
+	return out.String()
+}
+
+// toolMarkerRE matches the start of a tool-call envelope the model can emit:
+// XYML/QNML protocol tags (<|XYML|tool_calls>, <:QNML:invoke ...>, <|invoke>)
+// plus the legacy tool_calls JSON and function.name text contracts.
+var toolMarkerRE = regexp.MustCompile(`(?i)<[|:][^>]*|<(?:tool_calls|tool_use|invoke|parameter)\b|\{\s*"?tool_calls"?\s*:|function\.name\s*:`)
+
+// firstToolMarker returns the byte offset where the first tool-envelope
+// marker begins in text, or -1 when the text is plain prose.  A leading code
+// fence around the envelope is included in the capture range so it is held
+// with the envelope instead of leaking as bare text.
+func firstToolMarker(text string) int {
+	trimmed := strings.TrimLeft(text, " \t\r\n")
+	if strings.HasPrefix(trimmed, "```") {
+		rest := trimmed[3:]
+		for _, kw := range []string{"json", "xml", "text"} {
+			if strings.HasPrefix(strings.ToLower(rest), kw) {
+				rest = rest[len(kw):]
+				break
 			}
-			switch c {
-			case '\\':
-				esc = true
-			case '"':
-				inStr = false
-			}
-			continue
 		}
-		switch c {
-		case '"':
-			inStr = true
-		case '{':
-			depth++
-		case '}':
-			depth--
-			if depth == 0 {
-				return i
-			}
+		rest = strings.TrimLeft(rest, " \t\r\n")
+		if m := toolMarkerRE.FindStringIndex(rest); m != nil {
+			// capture from the fence (including any leading whitespace)
+			return len(text) - len(trimmed)
 		}
+		return -1
+	}
+	if m := toolMarkerRE.FindStringIndex(text); m != nil {
+		return m[0]
 	}
 	return -1
-}
-
-// jsonish reports whether the text looks like a JSON document declaration
-// (after removing a code fence), i.e. starts with '{' or '['.
-func jsonish(text string) bool {
-	t := strings.TrimSpace(stripJSONFence(text))
-	return strings.HasPrefix(t, "{") || strings.HasPrefix(t, "[")
 }
 
 // --- SSE helpers ---

@@ -11,11 +11,12 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app/server ./cmd/serv
 
 FROM alpine:latest
 
-RUN addgroup -g 1000 appuser && adduser -D -u 1000 -G appuser appuser
+RUN apk add --no-cache python3 && addgroup -g 1000 appuser && adduser -D -u 1000 -G appuser appuser
 
 WORKDIR /app
 
 COPY --from=builder /app/server /app/server
+COPY --from=builder /app/internal/toolcall /app/internal/toolcall
 COPY --chown=appuser:appuser config.example.json /app/config.json
 
 USER appuser

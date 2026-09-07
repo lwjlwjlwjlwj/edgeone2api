@@ -26,6 +26,27 @@ type ToolCall struct {
 	} `json:"function"`
 }
 
+// ToolProfile is the detected CLI tool profile (+ its prompt block).
+type ToolProfile struct {
+	ID          string   `json:"id"`
+	DisplayName string   `json:"display_name"`
+	Rules       []string `json:"rules"`
+	Block       string   `json:"block"`
+}
+
+// InstructionSet is the sidecar /instructions response.
+type InstructionSet struct {
+	Instructions string      `json:"instructions"`
+	Profile      ToolProfile `json:"profile"`
+	Error        string      `json:"error"`
+}
+
+// HistoryItem is one flattened chat message from /render_history.
+type HistoryItem struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
 // Client manages the Python sidecar process and exposes tool-call helpers.
 type Client struct {
 	mu      sync.Mutex
@@ -156,23 +177,39 @@ func (c *Client) WaitForHealth(ctx context.Context, timeout time.Duration) error
 	}
 }
 
-// BuildInstructions returns the XYML instruction block for the given tools.
+// BuildInstructions returns the XYML instruction block for the given tools,
+// together with the detected CLI tool-profile prompt block.
 // toolsJSON must be a JSON-serialized list of OpenAI tool definitions.
-func (c *Client) BuildInstructions(ctx context.Context, toolsJSON []byte) (string, error) {
-	var out struct {
-		Instructions string `json:"instructions"`
-		Error        string `json:"error"`
-	}
+func (c *Client) BuildInstructions(ctx context.Context, toolsJSON []byte) (InstructionSet, error) {
+	var out InstructionSet
 	if err := c.postJSON(ctx, "/instructions", map[string]any{"tools": rawJSON(toolsJSON)}, &out); err != nil {
-		return "", err
+		return out, err
 	}
 	if out.Error != "" {
-		return "", fmt.Errorf("sidecar: %s", out.Error)
+		return out, fmt.Errorf("sidecar: %s", out.Error)
 	}
-	return out.Instructions, nil
+	return out, nil
 }
 
-// ParseToolCalls extracts tool calls from model output text.
+// RenderHistory flattens OpenAI-style messages (with assistant tool_calls and
+// tool results) into plain chat messages for the plain-LLM upstream.
+// messagesJSON must be a JSON-serialized OpenAI messages array.
+func (c *Client) RenderHistory(ctx context.Context, messagesJSON []byte) ([]HistoryItem, error) {
+	var out struct {
+		Items []HistoryItem `json:"items"`
+		Error string        `json:"error"`
+	}
+	if err := c.postJSON(ctx, "/render_history", map[string]any{"messages": rawJSON(messagesJSON)}, &out); err != nil {
+		return nil, err
+	}
+	if out.Error != "" {
+		return nil, fmt.Errorf("sidecar: %s", out.Error)
+	}
+	return out.Items, nil
+}
+
+// ParseToolCalls extracts tool calls from model output text using the full
+// xyml engine (markup/XML/JSON/text-KV with CDATA-aware recovery).
 // toolsJSON must be the same JSON tool list passed to BuildInstructions.
 func (c *Client) ParseToolCalls(ctx context.Context, text string, toolsJSON []byte) ([]ToolCall, error) {
 	var out struct {
@@ -189,6 +226,46 @@ func (c *Client) ParseToolCalls(ctx context.Context, text string, toolsJSON []by
 		return nil, fmt.Errorf("sidecar: %s", out.Error)
 	}
 	return out.ToolCalls, nil
+}
+
+// RecoverToolCalls parses model output and, when parsing fails, reports why:
+// reason is "truncated", "parse_failed" or "" (no tool attempt).  A non-empty
+// reason means the caller should issue a corrective retry turn.
+func (c *Client) RecoverToolCalls(ctx context.Context, text string, toolsJSON []byte) ([]ToolCall, string, error) {
+	var out struct {
+		ToolCalls []ToolCall `json:"tool_calls"`
+		Reason    string     `json:"reason"`
+		Error     string     `json:"error"`
+	}
+	if err := c.postJSON(ctx, "/recover", map[string]any{
+		"text":  text,
+		"tools": rawJSON(toolsJSON),
+	}, &out); err != nil {
+		return nil, "", err
+	}
+	if out.Error != "" {
+		return nil, "", fmt.Errorf("sidecar: %s", out.Error)
+	}
+	return out.ToolCalls, out.Reason, nil
+}
+
+// RetryMessage builds the corrective user message for a retry turn after a
+// truncated / unparseable tool-call output.
+func (c *Client) RetryMessage(ctx context.Context, originalOutput, reason string) (string, error) {
+	var out struct {
+		Message string `json:"message"`
+		Error   string `json:"error"`
+	}
+	if err := c.postJSON(ctx, "/retry_message", map[string]any{
+		"original_output": originalOutput,
+		"reason":          reason,
+	}, &out); err != nil {
+		return "", err
+	}
+	if out.Error != "" {
+		return "", fmt.Errorf("sidecar: %s", out.Error)
+	}
+	return out.Message, nil
 }
 
 // --- helpers ---

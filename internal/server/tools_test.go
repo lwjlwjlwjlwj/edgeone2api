@@ -68,3 +68,48 @@ func TestTranslateToolCallNameRewrites(t *testing.T) {
 		t.Fatalf("unmapped name must pass through, got %q", got)
 	}
 }
+
+func TestTranslateToolCallsMCPPrefixedRunCommand(t *testing.T) {
+	calls := []openaiToolCall{{
+		ID: "call_1", Type: "function",
+		Function: openaiToolCallFn{Name: "mcp__edgeone__workspace_run_command", Arguments: `{"command":"ls -la /tmp"}`},
+	}}
+	out := translateToolCalls(calls, declared("exec"))
+	if len(out) != 1 || out[0].Function.Name != "exec" {
+		t.Fatalf("expected mcp__edgeone__workspace_run_command -> exec, got %+v", out)
+	}
+	if out[0].Function.Arguments != `{"command":"ls -la /tmp"}` {
+		t.Fatalf("arguments must pass through untouched, got %q", out[0].Function.Arguments)
+	}
+}
+
+func TestTranslateToolCallsMCPPrefixedReadFile(t *testing.T) {
+	calls := []openaiToolCall{{
+		ID: "call_1", Type: "function",
+		Function: openaiToolCallFn{Name: "mcp__edgeone__workspace_read_file", Arguments: `{"path":"/x"}`},
+	}}
+	out := translateToolCalls(calls, declared("read_file"))
+	if len(out) != 1 || out[0].Function.Name != "read_file" {
+		t.Fatalf("expected mcp__edgeone__workspace_read_file -> read_file, got %+v", out)
+	}
+}
+
+func TestTranslateToolCallsUnifiedExec(t *testing.T) {
+	calls := []openaiToolCall{{
+		ID: "call_1", Type: "function",
+		Function: openaiToolCallFn{Name: "u_exec", Arguments: `{}`},
+	}}
+	out := translateToolCalls(calls, declared("exec"))
+	if len(out) != 1 || out[0].Function.Name != "exec" {
+		t.Fatalf("expected u_exec -> exec, got %+v", out)
+	}
+}
+
+func TestTranslateToolCallNameMCPPrefixed(t *testing.T) {
+	if got := translateToolCallName("mcp__edgeone__workspace_run_command", declared("run_command")); got != "run_command" {
+		t.Fatalf("expected run_command, got %q", got)
+	}
+	if got := translateToolCallName("mcp__edgeone__workspace_glob", declared("glob_files")); got != "glob_files" {
+		t.Fatalf("expected glob_files, got %q", got)
+	}
+}

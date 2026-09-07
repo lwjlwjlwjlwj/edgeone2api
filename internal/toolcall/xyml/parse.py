@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 from functools import lru_cache
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from ._util import (
     canonicalize_markup,
@@ -36,7 +36,30 @@ from .config import (
 )
 from .build import _schema_properties, normalize_tools
 
-_THINK_RE = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
+_THINK_RE = re.compile(r" thinking[\s\S]*? response", re.IGNORECASE)
+
+# ── R24 / CDATA-aware constants (ported from refactor/xyml-package R24 fix) ─
+# SPEC-15: the CDATA opener may be the standard `<![CDATA[` or the pipe variant
+# `<![CDATA|` (deepseek-v4-flash emits the latter).  Shared by _CDATA_RE and
+# _strip_nested_cdata_markers.
+_CDATA_OPENER_RE = re.compile(r"<!\[CDATA[\[|]", re.IGNORECASE)
+_CDATA_RE = re.compile(r"<!\[CDATA[\[|]([\s\S]*?)\]\]>", re.IGNORECASE)
+# SPEC-11: protocol close tag written where the model omitted the CDATA `]]>`
+# closer. Matches `</|...>` / `</||...>` / `</:...>`-style tags only (leading
+# `|`/`:` after `</`), so HTML close tags like `</script>` inside CDATA are NOT
+# treated as the CDATA boundary.
+_PROTO_CLOSE_AFTER_CDATA = re.compile(r"</[|:]+[A-Za-z_][^>]*>", re.IGNORECASE)
+# SPEC-14: collapsed protocol marker reused as a parameter tag.
+_COLLAPSED_PARAM_RE = re.compile(
+    r"<([|:]{1,2})([A-Za-z_][A-Za-z0-9_]*)\1\s+name\s*=\s*[\"']?(\w+)[\"']?[^>]*>"
+    r"(.*?)"
+    r"</\1\2\1\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+# SPEC-17: a bare `<:>` residue line the model emits at the end of its
+# narrative, right before the XYML protocol block.
+_COLON_MARKER_RESIDUE_RE = re.compile(r"(?:^|\n)[ \t]*<:>[ \t]*(?=\n|$)")
+_XML_TAG_BODY_RE = re.compile(r"<([A-Za-z_][A-Za-z0-9_.:-]*)\b[^>]*>([\s\S]*?)</\1>")
 
 
 # ── Public API ──────────────────────────────────────────────────
@@ -157,6 +180,192 @@ def _apply_common_aliases(name: str, fixed: Dict[str, Any], tools: Any) -> Dict[
 
 
 # ── Markup parsing ──────────────────────────────────────────────
+# R24 / CDATA-aware helpers (ported from refactor/xyml-package R24 fix):
+# these prevent protocol tags / CDATA markers nested inside a parameter value
+# (e.g. a heredoc containing a literal XYML block) from being mis-parsed as new
+# tool calls or truncated, which previously leaked raw XML into the context.
+
+def _compute_cdata_bounds(text: str) -> Optional[Tuple[int, int]]:
+    """Return ``(start, end)`` for the single spanning CDATA section in ``text``.
+
+    Shared by ``_cdata_sections`` and ``_extract_cdata_from_value``.  When more
+    ``<![cdata[`` openers exist than matched ``_CDATA_RE`` pairs, an inner
+    ``]]>`` (from a nested protocol literal) has prematurely closed an outer
+    CDATA section — switch to greedy mode: take everything from the opener up
+    to the last closer (SPEC-10/R24).  If no closer exists at all (SPEC-10/11:
+    model omitted ``]]>`` and wrote a protocol close tag instead), extend the
+    range only to the first protocol close tag, not to end of text.
+
+    SPEC-16: greedy only fires when the surplus opener is genuinely nested —
+    it lies inside an already-matched pair AND an orphan ``]]>`` remains
+    unpaired.  A narrative literal ``<![CDATA[`` mention (backticked prose, a
+    command string) is a surplus opener with no pair to anchor to, so it must
+    NOT trigger greedy — that would mask the whole protocol block.
+
+    ``end`` is the exclusive *content* end.  Returns ``None`` when there is no
+    spanning CDATA section (sibling CDATA sections handled by the non-greedy
+    ``_CDATA_RE`` pass instead).
+    """
+    lower = text.lower()
+    opener = "<![cdata["
+    closer = "]]>"
+    matches = list(_CDATA_RE.finditer(text))
+    if lower.count(opener) <= len(matches):
+        # SPEC-20: even when opener count <= matched pairs, an "extra closer"
+        # may exist — the parameter value itself contains a ``]]>`` sequence.
+        closer_count = lower.count(closer)
+        if closer_count > len(matches) and matches:
+            last_close = lower.rfind(closer)
+            if last_close > matches[0].start():
+                return matches[0].start(), last_close
+        return None
+    first_open = lower.find(opener)
+    if first_open < 0:
+        return None
+    last_close = lower.rfind(closer)
+    if last_close > first_open:
+        pair_spans = [(m.start(), m.end()) for m in matches]
+        consumed_openers = {m.start() for m in matches}
+        consumed_closers = {m.end() - len(closer) for m in matches}
+        surplus = [
+            m.start()
+            for m in _CDATA_OPENER_RE.finditer(text)
+            if m.start() not in consumed_openers
+        ]
+        if not surplus:
+            return None
+        orphans = [
+            m.start()
+            for m in re.finditer(re.escape(closer), lower)
+            if m.start() not in consumed_closers
+        ]
+        if not orphans:
+            return None
+        for start, end in pair_spans:
+            if any(start < pos < end for pos in surplus):
+                return start, last_close
+        return None
+    # No closer after the first opener (SPEC-10/11): the model omitted the
+    # ``]]>``.  A protocol close tag following it defines the span.
+    first_proto_close = _PROTO_CLOSE_AFTER_CDATA.search(text, first_open)
+    if first_proto_close:
+        return first_open, first_proto_close.start()
+    if first_open == 0:
+        return first_open, len(text)
+    return None
+
+
+def _cdata_sections(text: str) -> List[Tuple[int, int]]:
+    """Return ``(start, end)`` ranges covering every CDATA section in ``text``.
+
+    Default: non-greedy matching via ``_CDATA_RE``, compatible with multiple
+    sibling CDATA sections.  R24/SPEC-10/11: when more ``<![CDATA[`` openers
+    exist than matched pairs, an inner ``]]>`` (from a nested protocol literal)
+    has prematurely closed an outer CDATA section — fall back to the single
+    spanning range computed by ``_compute_cdata_bounds``.
+    """
+    sections = [(match.start(), match.end()) for match in _CDATA_RE.finditer(text)]
+    bounds = _compute_cdata_bounds(text)
+    if bounds is not None:
+        sections = [bounds]
+    return sections
+
+
+def _extract_cdata_from_value(raw: str) -> List[str]:
+    """Extract CDATA contents from a parameter value string.
+
+    Default: non-greedy findall, compatible with multiple sibling CDATA
+    sections.  R24/SPEC-10/11: when more ``<![CDATA[`` openers exist than
+    matched pairs, fall back to the single spanning range computed by
+    ``_compute_cdata_bounds`` and strip the ``<![CDATA[`` prefix.
+    """
+    raw_str = str(raw or "")
+    cdata_matches = _CDATA_RE.findall(raw_str)
+    bounds = _compute_cdata_bounds(raw_str)
+    if bounds is not None:
+        first_open, end = bounds
+        cdata_matches = [raw_str[first_open + len("<![CDATA["):end]]
+    return cdata_matches
+
+
+def _strip_nested_cdata_markers(raw: str, require_closer: bool = True) -> Optional[str]:
+    """SPEC-15: loop-peel remaining CDATA openers + ``]]>``/``]>`` tail residue.
+
+    Returns None when the value is not CDATA-shaped (no leading opener, or — in
+    the require_closer path — no trailing closer), so callers fall through to
+    their plain-text handling.
+    """
+    text = str(raw or "")
+    if not text or not _CDATA_OPENER_RE.match(text):
+        return None
+    if require_closer and not re.search(r"(?:]]>|]>)[ \t]*$", text):
+        return None
+    while True:
+        match = _CDATA_OPENER_RE.match(text)
+        if not match:
+            break
+        text = text[match.end():]
+    return re.sub(r"(?:]]>|]>)[ \t]*$", "", text)
+
+
+def _strip_colon_marker_residue(text: str) -> str:
+    """Strip standalone ``<:>`` residue lines from content text (SPEC-17)."""
+    return _COLON_MARKER_RESIDUE_RE.sub("", str(text or ""))
+
+
+def _iter_protocol_blocks(text: str, protocol: ProtocolSpec, tag: str) -> Iterable[Tuple[str, str]]:
+    """Yield ``(attrs, body)`` for each properly nested block of ``tag``.
+
+    A LIFO stack over every protocol open/close tag keeps the nesting balanced
+    so we never terminate a block early or mistreat a bare ``<:``/``<|`` in
+    prose as a boundary.  CDATA sections are opaque to this scanner: a
+    tag-looking string inside one (e.g. ``</script>`` in a Python heredoc) is
+    literal content, not a protocol boundary.
+    """
+    cdata_sections = _cdata_sections(text)
+
+    def _inside_cdata(pos: int) -> bool:
+        return any(start <= pos < end for start, end in cdata_sections)
+
+    events: List[Tuple[Any, ...]] = []
+    events.extend(
+        ("open", m.start(), m.end(), m.group("attrs") or "", m.group("tag"))
+        for m in _protocol_any_open_tag_re(
+            protocol.name,
+            protocol.tags["root"],
+            protocol.tags["invoke"],
+            protocol.tags["parameter"],
+        ).finditer(text)
+        if not _inside_cdata(m.start())
+    )
+    events.extend(
+        ("close", m.start(), m.end())
+        for m in _protocol_any_close_tag_re(
+            protocol.name,
+            protocol.tags["root"],
+            protocol.tags["invoke"],
+            protocol.tags["parameter"],
+        ).finditer(text)
+        if not _inside_cdata(m.start())
+    )
+    events.sort(key=lambda event: event[1])
+    stack: List[Tuple[Any, ...]] = []
+    pairings: List[Tuple[Tuple[Any, ...], int]] = []
+    for event in events:
+        if event[0] == "open":
+            same_depth = sum(1 for item in stack if item[4].lower() == event[4].lower())
+            stack.append(event + (same_depth,))
+        elif stack:
+            pairings.append((stack.pop(), event[1]))
+    wanted = tag.lower()
+    for opener, close_start in pairings:
+        if opener[4].lower() != wanted:
+            continue
+        if opener[5] != 0:
+            continue
+        yield opener[3], text[opener[2]:close_start]
+
+
 def _parse_protocol_markup(
     text: Any,
     protocol: ProtocolSpec,
@@ -168,11 +377,11 @@ def _parse_protocol_markup(
     canonical = _expand_short_close_tags(canonical, protocol)
     calls: List[ParsedToolCall] = []
     for candidate in _extract_protocol_candidates(canonical, protocol):
-        for match in _protocol_tag_block_re(protocol, protocol.tags["invoke"]).finditer(candidate):
-            name = _canonical_tool_name(_extract_name_attr(match.group(1)), allowed, config)
+        for attrs, body in _iter_protocol_blocks(candidate, protocol, protocol.tags["invoke"]):
+            name = _canonical_tool_name(_extract_name_attr(attrs), allowed, config)
             if not name:
                 continue
-            input = _parse_protocol_parameters(match.group(2), protocol, config)
+            input = _parse_protocol_parameters(body, protocol, config)
             calls.append(ParsedToolCall(id=config.id_factory(), name=name, input=input))
     if not calls:
         calls.extend(_parse_loose_protocol_calls(canonical, protocol, allowed, tools, config))
@@ -180,10 +389,7 @@ def _parse_protocol_markup(
 
 
 def _extract_protocol_candidates(text: str, protocol: ProtocolSpec) -> List[str]:
-    candidates = [
-        m.group(2)
-        for m in _protocol_tag_block_re(protocol, protocol.tags["root"]).finditer(text)
-    ]
+    candidates = [body for _, body in _iter_protocol_blocks(text, protocol, protocol.tags["root"])]
     if candidates:
         return candidates
     match = _protocol_open_tag_re(protocol, protocol.tags["invoke"]).search(text)
@@ -192,10 +398,10 @@ def _extract_protocol_candidates(text: str, protocol: ProtocolSpec) -> List[str]
 
 def _parse_protocol_parameters(body: str, protocol: ProtocolSpec, config: ToolCallConfig) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
-    for match in _protocol_tag_block_re(protocol, protocol.tags["parameter"]).finditer(body):
-        name = _extract_name_attr(match.group(1))
+    for attrs, value in _iter_protocol_blocks(body, protocol, protocol.tags["parameter"]):
+        name = _extract_name_attr(attrs)
         if name:
-            out[name] = _decode_markup_value(match.group(2), name, config)
+            out[name] = _decode_markup_value(value, name, config)
     return out or _parse_text_kv_input(body)
 
 
@@ -231,13 +437,10 @@ def _parse_loose_protocol_calls(
         for field_raw, _, field_is_tool, field_position in attributes[index + 1:]:
             if field_position >= next_tool or field_is_tool:
                 break
-            cdata = re.search(
-                r"<\s*(?:[|:])*\s*!\[CDATA\[([\s\S]*?)\]\]>",
-                text[field_position:next_tool],
-                re.IGNORECASE,
-            )
-            if cdata:
-                input[field_raw] = _decode_markup_value(cdata.group(1), field_raw, config)
+            cdata_matches = _extract_cdata_from_value(text[field_position:next_tool])
+            if cdata_matches:
+                raw_string = str(field_raw or "").lower() in config.raw_string_params
+                input[field_raw] = _coerce_markup_scalar(cdata_matches[0], raw_string=raw_string)
         filtered = _filter_input_for_tool(name, input, tools)
         if not filtered and _required_tool_args(name, tools):
             continue
@@ -282,19 +485,31 @@ def _expand_short_close_tags(text: str, protocol: ProtocolSpec) -> str:
 
 
 def _decode_markup_value(raw: Any, parameter_name: Any, config: ToolCallConfig) -> Any:
-    cdata_matches = re.findall(
-        r"<\s*(?:[|:])*\s*!\[CDATA\[([\s\S]*?)\]\]>",
-        str(raw or ""),
-        re.IGNORECASE,
-    )
+    raw_str = str(raw or "")
+    cdata_matches = _extract_cdata_from_value(raw_str)
     raw_string = str(parameter_name or "").lower() in config.raw_string_params
     if cdata_matches:
         joined = "".join(cdata_matches)
+        # SPEC-15: loop-peel remaining CDATA openers + tail residue from the
+        # extracted content (inner opener prefix / `]]>` / `]>` residue).
+        peeled = _strip_nested_cdata_markers(joined, require_closer=False)
+        if peeled is not None:
+            joined = peeled
         return joined if raw_string else _coerce_markup_scalar(joined, raw_string=False)
     if not raw_string:
-        parsed, nested = _parse_nested_markup_value(str(raw or ""), config)
+        parsed, nested = _parse_nested_markup_value(raw_str, config)
         if parsed:
             return nested
+    # SPEC-14: strip nested collapsed marker from parameter values.
+    collapsed = _COLLAPSED_PARAM_RE.search(raw_str)
+    if collapsed:
+        inner = raw_str[:collapsed.start()] + collapsed.group(4) + raw_str[collapsed.end():]
+        return inner if raw_string else _coerce_markup_scalar(inner, raw_string=False)
+    # SPEC-15 fallback: the value is CDATA-shaped end-to-end but the closer was
+    # non-standard (`]>` residue), so the widened _CDATA_RE did not match.
+    peeled = _strip_nested_cdata_markers(raw_str, require_closer=True)
+    if peeled is not None:
+        return peeled if raw_string else _coerce_markup_scalar(peeled, raw_string=False)
     return _coerce_markup_scalar(raw, raw_string=raw_string)
 
 
@@ -796,6 +1011,50 @@ def _protocol_open_tag_re(protocol: ProtocolSpec, tag: str) -> re.Pattern:
 
 def _protocol_tag_block_re(protocol: ProtocolSpec, tag: str) -> re.Pattern:
     return _protocol_tag_block_re_key(protocol.name, tag)
+
+
+@lru_cache(maxsize=32)
+def _protocol_any_open_tag_re_key(proto_name: str, root: str, invoke: str, parameter: str) -> re.Pattern:
+    tag_words = sorted([root, invoke, parameter], key=len, reverse=True)
+    tag_alt = "|".join(re.escape(word) for word in tag_words)
+    # 支持无协议名格式 (<|tool_calls>, <|invoke name="X">):
+    # 协议名前缀段 (?:[A-Za-z0-9_]+[|:]\s*)? 完全可选; 分隔符保持 `|`/`:`
+    # 强分隔符要求，不允许 `\s+`, 避免 `<|XYML|invoke>` 的 XYML| 被误吞
+    # (Ticket 05 依赖)。
+    return re.compile(
+        r"<\s*(?:[|:]\s*)*(?:[A-Za-z0-9_]+[|:]\s*)?(?P<tag>"
+        + tag_alt
+        + r"|[A-Za-z_][A-Za-z0-9_.:-]*)\b(?P<attrs>[^>]*)>",
+        re.IGNORECASE,
+    )
+
+
+@lru_cache(maxsize=32)
+def _protocol_any_close_tag_re_key(proto_name: str, root: str, invoke: str, parameter: str) -> re.Pattern:
+    tag_words = sorted([root, invoke, parameter], key=len, reverse=True)
+    tag_alt = "|".join(re.escape(word) for word in tag_words)
+    # SPEC-21: require at least one | or : separator so HTML/XML close tags
+    # (</script>, </body>) are NOT matched as protocol close tags.
+    return re.compile(
+        r"<\s*/\s*(?:"
+        r"[|:]{1,2}\s*[A-Za-z0-9_]+\s*[|:]{1,2}\s*"  # </|XYML|tag> or </:XYML:tag>
+        r"|"
+        r"[A-Za-z0-9_]+\s*[|:]{1,2}\s*"  # </XYML|tag> (separator after name)
+        r"|"
+        r"[|:]{1,2}\s*[A-Za-z0-9_]+\s*"  # </|XYML> (separator before name, tag omitted)
+        r")"
+        r"(?:" + tag_alt + r"|[A-Za-z_][A-Za-z0-9_.:-]*)?"
+        r"\s*>",
+        re.IGNORECASE,
+    )
+
+
+def _protocol_any_open_tag_re(protocol_name: str, root: str, invoke: str, parameter: str) -> re.Pattern:
+    return _protocol_any_open_tag_re_key(protocol_name, root, invoke, parameter)
+
+
+def _protocol_any_close_tag_re(protocol_name: str, root: str, invoke: str, parameter: str) -> re.Pattern:
+    return _protocol_any_close_tag_re_key(protocol_name, root, invoke, parameter)
 
 
 # ── Misc internal helpers ───────────────────────────────────────

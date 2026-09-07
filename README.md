@@ -14,7 +14,7 @@
 - **浏览器指纹隔离** — 每个会话独立 UA/Sec-CH-UA 指纹，上游将每个会话视为独立浏览器，限流互不影响
 - **弹性凭证池** — 会话池自动创建/复用/维护，配额感知轮换（绕过单一会话的用量上限）；会话不足时并发后台扩容，突发请求不排队
 - **SSE 流式** — 流式透传上游事件流（文本/推理/工具调用 delta），非流式自动聚合 `content`
-- **工具调用** — 原生支持 OpenAI `tools` 参数：客户端声明的工具定义注入系统指令，模型首轮即以 JSON 文本声明工具调用，网关强校验解析为标准 `tool_calls` 返回（ToolForge 风格，首轮截断，一次 LLM 调用即可闭环）；`role:"tool"` 结果回传后自然续接
+- **工具调用** — 原生支持 OpenAI `tools` 参数：完整移植 toolforge 的 XYML 受控标记协议引擎（`refactor/xyml-package`），客户端声明的工具定义经 sidecar 生成协议指令，模型首轮即以 `<|XYML|tool_calls>` 协议声明工具调用，网关以同一引擎强校验解析为标准 `tool_calls`（ToolForge 风格，首轮截断，一次 LLM 调用即可闭环）；`role:"tool"` 结果回传后自然续接
 - **可选鉴权** — 配置 `api_key` 后需 Bearer token 访问
 - **Go 单二进制** — 无外部依赖，`go build` 即得
 
@@ -152,9 +152,14 @@ OpenAI 兼容。支持 `stream`（SSE）、`max_tokens`、`temperature`、`top_p
 ## 工具调用（ToolForge 风格，首轮截断）
 
 网关原生支持 OpenAI `tools` 参数。核心思路：**上游 Harness 只当纯文本 LLM 用**（`minimal` preset），
-客户端声明的工具定义以协议形式注入系统指令；模型**从不真实执行工具**——它只用首轮 JSON
-文本「声明」要调用哪个客户端工具，网关解析、强校验后返回标准 `tool_calls`，工具的真实执行
-完全发生在客户端侧（agent CLI 用自己的实现执行，包括加载 skill）。
+客户端声明的工具定义以受控标记协议（XYML/QNML）形式注入系统指令；模型**从不真实执行工具**——
+它只用首轮协议文本「声明」要调用哪个客户端工具，网关解析、强校验后返回标准 `tool_calls`，
+工具的真实执行完全发生在客户端侧（agent CLI 用自己的实现执行，包括加载 skill）。
+
+工具解析引擎完整移植自 [toolforge `refactor/xyml-package` 分支](https://github.com/lwjlwjlwjlwj/toolforge/tree/refactor/xyml-package)：
+`internal/toolcall/` 内嵌 Python sidecar（`xyml` 解析引擎 + `fc` 策略层 + `models` 规范层），
+网关启动时自动拉起并健康检查（失败快速退出），所有协议渲染/解析/恢复都委托给它——不再维护
+任何 Go 侧 JSON 修补逻辑。
 
 ```bash
 curl -s http://localhost:7863/v1/chat/completions \
@@ -168,33 +173,31 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 ### 工作原理
 
-1. 客户端请求带 `tools`，网关把每个工具的定义（名字/描述/参数摘要）序列化进系统指令
-   （`BuildDirective`，见 `internal/upstream/directive.go`），并声明「工具调用协议」：需要工具时，
-   整段回答必须是一个 `{"tool_calls":[...]}` JSON 文本（无代码围栏、无多余文字）；
-   `arguments` 要求输出为 **JSON 对象**（`{"command":"..."}`，只需一层标准转义），避免深层
-   双重转义导致模型输出非法 JSON
-2. 上游首轮输出即为该 JSON 文本；网关在 `turn/end` 事件处**截断**，解析为标准 `tool_calls`
-   （`finish_reason: "tool_calls"`，见 `internal/server/server.go`）——一次 LLM 调用即完成工具轮
-3. 客户端执行工具后，把结果以 `role: "tool"` 消息回传，网关以 `[Tool Result]` 文本透传给上游，
-   模型下一回合自然续接给出最终答案（`finish_reason: "stop"`）
+1. 客户端请求带 `tools`：sidecar 依据 `fc` 策略层生成 XYML 指令块（`<|XYML|tool_calls>` +
+   `<|XYML|invoke name="...">` + `<|XYML|parameter name="...">`，字符串以 `<![CDATA[ ... ]]>`
+   包裹，天然规避 JSON 转义地狱），并叠加检测到的 CLI 工具风格 profile 提示块；完整历史
+   （含 assistant `tool_calls` / `role:"tool"` 结果）经 `render_history` 压平成纯文本，上游只见到
+   普通聊天文本（`buildItems`，见 `internal/server/server.go`）
+2. 上游首轮输出即协议信封；网关以 `streamSieve` 实时分流：普通散文直接流给客户端，疑似协议
+   内容暂存到回合结束，由 sidecar 的 xyml 引擎解析为标准 `tool_calls`（`finish_reason: "tool_calls"`）
+3. 若输出被截断或解析失败，sidecar 恢复层（`recovery`）判定原因并发起**单次纠错回合**重新输出；
+   `role:"tool"` 结果回传后以 `[Tool Result]` 文本透传，模型下一回合自然续接给出最终答案
+   （`finish_reason: "stop"`）
 
 ### 实测行为
 
-- **名字强校验**：返回的工具名只取自客户端声明的名称集合，不会涌现上游沙箱原生工具
-  （`mcp__edgeone__*` 等在客户端侧不可真实执行的假工具）
+- **名字翻译**：模型输出上游原生名时（`mcp__edgeone__workspace_run_command`、`u_exec`、
+  `bash`/`read`/`glob` 等），翻译层（`translateToolCalls`，见 `internal/server/tools.go`）先剥离
+  `mcp__`/`u_` 等前缀做候选归一，再按别名映射表重写为客户端声明名（`run_command`/`u_exec` →
+  `exec`、`read` → `read_file`）
 - **skill 理解**：声明 `skill` / Claude Code 风格 `Skill` 工具后，模型正确返回
   `{"skill_name":"senseNova-image-generator","arguments":{...}}`，参数自动细化任务需求
 - **不误触发**：无工具需求的纯对话直接文本回答，`finish_reason: "stop"`
 
-> **兼容兜底**：若模型仍输出上游裸名（`read`/`bash`/`glob`），内置**工具名翻译层**
-> （`translateToolCalls`，见 `internal/server/tools.go`）按别名映射表重写为客户端声明名
-> （`read` → `read_file`），无法映射的名字丢弃并告警。
-
-> **解析健壮性**（`parseToolCalls`，见 `internal/server/server.go`）：网关对模型输出做多层容错——
-> ① `arguments` 兼容 object 与 JSON 字符串两种形态；② 对 `"arguments":"{...}"` 这类「对象被外层
-> 引号包裹」的畸形输出自动剥壳修复；③ 极端情况下（引号转义丢失无法确定性修复）触发一次**纠错重试**，
-> 向会话发送协议纠错指令让模型重新输出 tool_calls；流式请求中疑似 JSON 的应答会被暂存到回合结束再
-> 决策，避免把损坏的工具调用 JSON 当成普通文本流给客户端。
+> **解析健壮性**（sidecar xyml 引擎，与上游 `refactor/xyml-package` 完全同源）：CDATA 双重开启标记
+> （`<![CDATA[` / `<![CDATA|`）、未闭合 `]]>`、折叠协议标记、`<:>` 残留等 R24 修复全部内置；
+> `unknown_tool` 与 `missing_required` 均保留不丢，把裁决权交给名字翻译层与客户端；截断输出触发
+> 单次纠错重试回合（`recover`/`retry_message`）。
 
 ### 一次对话时序
 
@@ -207,14 +210,14 @@ sequenceDiagram
 
     Note over C,G: 会话池已预创建上游会话并保持 /api/events.mux SSE 长连接
     C->>G: POST /v1/chat/completions（messages + tools）
-    G->>G: 组装 prompt：工具定义注入系统指令 + 用户消息
+    G->>G: sidecar 渲染：XYML 指令 + profile 块 + 历史压平 + 用户消息
     G->>H: POST /api/session.prompt {mode:"steer", content:[...]}
     H-->>G: accepted:true，LLM 首轮开始生成
     H-->>G: SSE: turn/start (turn=1)
     H-->>G: SSE: assistant/chunk（reasoning-delta、text-delta × N）
-    Note over H: 模型按协议输出 tool_calls JSON 文本，<br/>不执行任何真实工具
+    Note over H: 模型按协议输出 XYML tool_calls 信封，<br/>不执行任何真实工具
     H-->>G: SSE: turn/end (turn=1)
-    G->>G: 首轮截断：解析 JSON → 强校验工具名 → 标准 tool_calls
+    G->>G: 首轮截断：xyml 引擎解析协议 → 工具名翻译 → 标准 tool_calls
     G-->>C: 200 {tool_calls, finish_reason:"tool_calls"}
     Note over C: 客户端执行工具<br/>（读文件 / 加载 skill / 生成图片）
     C->>G: POST /v1/chat/completions（assistant tool_calls + role:"tool" 结果）
@@ -283,7 +286,14 @@ edgeone2api/
 │   ├── server/server.go          # OpenAI 兼容 handler + 流式/非流式 + 工具调用
 │   ├── server/tools.go           # 工具名翻译层（上游原生名 → 客户端声明名）
 │   ├── server/tools_test.go      # 翻译层单测
-│   └── toolcall/                 # 可选的 ToolForge 工具调用中间件（Python xyml 移植，独立部署）
+│   ├── server/parsetool_test.go  # sidecar 集成测试（xyml 解析/恢复/渲染）
+│   ├── upstream/directive.go     # 无工具指令（tools 存在时指令由 sidecar 生成）
+│   └── toolcall/                 # ToolForge 工具引擎 sidecar（Python，完整移植）
+│       ├── client.go             # sidecar 子进程管理 + Go 方法封装
+│       ├── server.py             # HTTP 端点：instructions/render_history/parse/recover/retry_message
+│       ├── models/               # canonical 模型层（ToolCall/ToolDef/Message/CanonicalRequest）
+│       ├── fc/                   # fc 策略层：inject/parse/recovery/profiles/policy
+│       └── xyml/                 # xyml 解析引擎（parse.py R24/CDATA 修复版，与上游同源）
 ├── config.example.json
 ├── Dockerfile
 ├── docker-compose.yml
