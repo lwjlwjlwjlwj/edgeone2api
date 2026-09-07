@@ -72,6 +72,7 @@ type PoolConfig struct {
 	MinSize          int
 	MaxSize          int
 	TTL              time.Duration // session max lifetime
+	FreeTTL          time.Duration // max age for free (unbound/anonymous) sessions, independent of TTL
 	BindTTL          time.Duration // idle bound-session lifetime
 	MaxReqPerSession int           // max requests before session is recycled (0 = unlimited)
 	UpstreamURL      string
@@ -120,8 +121,15 @@ func NewPool(cfg PoolConfig) *Pool {
 	if cfg.BindTTL == 0 {
 		cfg.BindTTL = 30 * time.Minute
 	}
-	// TTL 0 means no max lifetime — sessions are only recycled on failure
-	// (FailedCount >= 3) or when MaxReqPerSession is exceeded.
+	// FreeTTL caps the age of free (anonymous) sessions so upstream-destroyed
+	// zombie sessions are rotated out even when TTL is 0.  Default 90m matches
+	// the observed upstream session lifetime (~1.5-2h).  0 explicitly disables it.
+	if cfg.FreeTTL == 0 {
+		cfg.FreeTTL = 90 * time.Minute
+	}
+	// TTL 0 means no max lifetime for bound sessions — they are only recycled
+	// on failure or when MaxReqPerSession is exceeded.  Free sessions are
+	// independently bounded by FreeTTL above.
 	if cfg.MaxReqPerSession == 0 {
 		cfg.MaxReqPerSession = 200
 	}
@@ -270,6 +278,19 @@ func (p *Pool) warmError() error {
 	return p.lastWarmErr
 }
 
+// freeStale reports whether a free-list candidate is too old to lend out.
+// Applies the explicit TTL when set, and always the FreeTTL (age cap for free
+// sessions) so upstream-destroyed zombies are rotated even when TTL is 0.
+func (p *Pool) freeStale(now time.Time, s *Session) bool {
+	if p.config.FreeTTL > 0 && now.Sub(s.CreatedAt) > p.config.FreeTTL {
+		return true
+	}
+	if p.config.TTL > 0 && now.Sub(s.CreatedAt) > p.config.TTL {
+		return true
+	}
+	return false
+}
+
 // Acquire gets an available free session, locking it for exclusive use.
 // Caller must call Release() when done.
 // When all free sessions are busy, a background session creation is started
@@ -281,7 +302,7 @@ func (p *Pool) Acquire(ctx context.Context) (*Session, error) {
 		p.mu.Lock()
 		now := time.Now()
 		for _, s := range p.free {
-			if p.config.TTL > 0 && now.Sub(s.CreatedAt) > p.config.TTL {
+			if p.freeStale(now, s) {
 				continue // expired
 			}
 			if s.mu.TryLock() {
@@ -346,7 +367,7 @@ func (p *Pool) Bind(ctx context.Context, key string) (*Session, error) {
 		// Need a session for this key: reuse a free one or create new
 		now := time.Now()
 		for i, s := range p.free {
-			if p.config.TTL > 0 && now.Sub(s.CreatedAt) > p.config.TTL {
+			if p.freeStale(now, s) {
 				continue
 			}
 			if s.mu.TryLock() {
@@ -637,6 +658,7 @@ func (p *Pool) Stats() map[string]interface{} {
 		"min":             p.config.MinSize,
 		"max":             p.config.MaxSize,
 		"ttl_s":           p.config.TTL.Seconds(),
+		"free_ttl_s":      p.config.FreeTTL.Seconds(),
 		"bind_ttl_s":      p.config.BindTTL.Seconds(),
 		"active":          active,
 		"failed":          failed,
@@ -661,10 +683,11 @@ func (p *Pool) maintain() {
 		now := time.Now()
 		p.mu.Lock()
 
-		// Drop expired free sessions
+		// Drop expired free sessions (FreeTTL age cap + explicit TTL)
 		kept := make([]*Session, 0, len(p.free))
 		for _, s := range p.free {
-			if p.config.TTL > 0 && now.Sub(s.CreatedAt) > p.config.TTL {
+			if p.freeStale(now, s) {
+				log.Printf("pool: reaped stale free session %s (age %s)", s.SessionID, now.Sub(s.CreatedAt).Round(time.Second))
 				continue
 			}
 			kept = append(kept, s)
@@ -687,7 +710,7 @@ func (p *Pool) maintain() {
 		// Count genuinely available free sessions (not expired, not busy).
 		freeAvail := 0
 		for _, s := range p.free {
-			if p.config.TTL > 0 && now.Sub(s.CreatedAt) > p.config.TTL {
+			if p.freeStale(now, s) {
 				continue
 			}
 			if s.mu.TryLock() {

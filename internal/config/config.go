@@ -1,4 +1,4 @@
-﻿package config
+package config
 
 import (
 	"encoding/json"
@@ -7,16 +7,17 @@ import (
 )
 
 type Config struct {
-	Listen           string                 `json:"listen"`
-	APIKey           string                 `json:"api_key"`
-	Models           []string               `json:"models"`
-	PoolMin          int                    `json:"pool_min"`
-	PoolMax          int                    `json:"pool_max"`
-	TTLMin           int                    `json:"ttl_minutes"`
-	BindTTLMin       int                    `json:"bind_ttl_minutes"`
-	MaxReqPerSession int                    `json:"max_req_per_session"`
-	UpstreamURL      string                 `json:"upstream_url"`
-	AgentPreset      string                 `json:"agent_preset"`
+	Listen           string                  `json:"listen"`
+	APIKey           string                  `json:"api_key"`
+	Models           []string                `json:"models"`
+	PoolMin          int                     `json:"pool_min"`
+	PoolMax          int                     `json:"pool_max"`
+	TTLMin           int                     `json:"ttl_minutes"`
+	FreeTTLMin       int                     `json:"free_ttl_minutes"`
+	BindTTLMin       int                     `json:"bind_ttl_minutes"`
+	MaxReqPerSession int                     `json:"max_req_per_session"`
+	UpstreamURL      string                  `json:"upstream_url"`
+	AgentPreset      string                  `json:"agent_preset"`
 	ModelMap         map[string]ModelMapping `json:"model_map"`
 }
 
@@ -33,13 +34,13 @@ type ModelMapping struct {
 // deepseek-official models require the credentials service and are excluded.
 func defaultModelMap() map[string]ModelMapping {
 	return map[string]ModelMapping{
-		"@makers/hy3":                {Provider: "edgeone-makers", Model: "@makers/hy3"},
-		"@makers/hy3-preview":        {Provider: "edgeone-makers", Model: "@makers/hy3-preview"},
-		"@makers/deepseek-v4-pro":    {Provider: "edgeone-makers", Model: "@makers/deepseek-v4-pro"},
-		"@makers/deepseek-v4-flash":  {Provider: "edgeone-makers", Model: "@makers/deepseek-v4-flash"},
-		"@makers/minimax-m3":         {Provider: "edgeone-makers", Model: "@makers/minimax-m3"},
-		"@makers/minimax-m2.7":       {Provider: "edgeone-makers", Model: "@makers/minimax-m2.7"},
-		"@makers/kimi-k2.6":          {Provider: "edgeone-makers", Model: "@makers/kimi-k2.6"},
+		"@makers/hy3":               {Provider: "edgeone-makers", Model: "@makers/hy3"},
+		"@makers/hy3-preview":       {Provider: "edgeone-makers", Model: "@makers/hy3-preview"},
+		"@makers/deepseek-v4-pro":   {Provider: "edgeone-makers", Model: "@makers/deepseek-v4-pro"},
+		"@makers/deepseek-v4-flash": {Provider: "edgeone-makers", Model: "@makers/deepseek-v4-flash"},
+		"@makers/minimax-m3":        {Provider: "edgeone-makers", Model: "@makers/minimax-m3"},
+		"@makers/minimax-m2.7":      {Provider: "edgeone-makers", Model: "@makers/minimax-m2.7"},
+		"@makers/kimi-k2.6":         {Provider: "edgeone-makers", Model: "@makers/kimi-k2.6"},
 	}
 }
 
@@ -50,7 +51,8 @@ func defaultConfig() Config {
 		Models:           []string{"@makers/deepseek-v4-flash", "@makers/deepseek-v4-pro"},
 		PoolMin:          4,
 		PoolMax:          32,
-		TTLMin:           0, // 0 = 无生命周期限制，会话仅在调用失败或达 max_req_per_session 时回收
+		TTLMin:           0,  // 0 = bound/free 会话无统一生命周期上限（free 会话另由 FreeTTL 约束）
+		FreeTTLMin:       90, // free 会话年龄上限：上游 session 约 1.5-2h 后会被销毁，free 会话超过此时长即回收重建，避免僵尸会话导致 session not found
 		BindTTLMin:       30,
 		MaxReqPerSession: 200,
 		UpstreamURL:      "https://deepseek-harness.edgeone.cool",

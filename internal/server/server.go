@@ -274,7 +274,9 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 		items := s.buildItems(session, sessionKey, msgs, toolsJSON)
 		cs, err := session.Client.StartChat(ctx, session.SessionID, session.ConversationID, items)
 		if err != nil {
-			if upstream.IsQuotaError(err) {
+			if upstream.IsQuotaError(err) || upstream.IsSessionNotFound(err) {
+				// Quota / session-destroyed: rope the session and retry once with a
+				// fresh one (transparent rotation instead of failed response).
 				session.MarkQuotaExceeded()
 				release(false)
 				session, err = reacquire(ctx)
@@ -397,7 +399,7 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 		items := s.buildItems(session, sessionKey, msgs, toolsJSON)
 		cs, err = session.Client.StartChat(ctx, session.SessionID, session.ConversationID, items)
 		if err != nil {
-			if upstream.IsQuotaError(err) {
+			if upstream.IsQuotaError(err) || upstream.IsSessionNotFound(err) {
 				session.MarkQuotaExceeded()
 				release(false)
 				session, err = reacquire(ctx)

@@ -27,6 +27,7 @@ func main() {
 		MinSize:          cfg.PoolMin,
 		MaxSize:          cfg.PoolMax,
 		TTL:              time.Duration(cfg.TTLMin) * time.Minute,
+		FreeTTL:          time.Duration(cfg.FreeTTLMin) * time.Minute,
 		BindTTL:          time.Duration(cfg.BindTTLMin) * time.Minute,
 		MaxReqPerSession: cfg.MaxReqPerSession,
 		UpstreamURL:      cfg.UpstreamURL,

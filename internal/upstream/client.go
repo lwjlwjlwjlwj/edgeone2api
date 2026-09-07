@@ -735,3 +735,14 @@ func IsQuotaError(err error) bool {
 	}
 	return false
 }
+
+// IsSessionNotFound reports whether the upstream error means the underlying
+// session was destroyed server-side (e.g. the free session aged past the
+// upstream's lifetime and became a zombie).  Callers should reacquire a fresh
+// session and retry once rather than surface a 502.
+func IsSessionNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "not found")
+}
