@@ -112,8 +112,10 @@ type openaiToolCallFn struct {
 }
 
 type openaiMessage struct {
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content"`
+	Role       string           `json:"role"`
+	Content    json.RawMessage  `json:"content"`
+	ToolCalls  []openaiToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string           `json:"tool_call_id,omitempty"`
 }
 
 // --- Chat Completions ---
@@ -521,17 +523,46 @@ func convertMessages(msgs []openaiMessage) []upstream.ContentItem {
 			if text != "" {
 				items = append(items, upstream.ContentItem{Type: "text", Text: text})
 			}
-		case "tool":
-			// Tool result message echoed back by the client after it executed
-			// a tool_call: pass it through so the model can give the final
-			// answer in the same conversation.
-			text := extractContent(msg.Content)
-			if text != "" {
-				items = append(items, upstream.ContentItem{Type: "text", Text: "[Tool Result] " + text})
+			// Preserve a previous tool_calls turn as fenced text so the
+			// upstream agent sees which tool-call was issued (with its id),
+			// enabling it to match a later tool result and continue.
+			if len(msg.ToolCalls) > 0 {
+				items = append(items, upstream.ContentItem{Type: "text", Text: formatAssistantToolCalls(msg.ToolCalls)})
 			}
+		case "tool":
+			text := extractContent(msg.Content)
+			if text == "" {
+				continue
+			}
+			// Tool result echoed by the client.  The upstream session.prompt
+			// only accepts plain {type,text} content items — it rejects
+			// structured "tool" items — so we fold the result into a labeled
+			// text turn, keeping tool_call_id so the upstream agent can
+			// correlate it with the assistant's earlier tool call and continue.
+			label := "[Tool Result]"
+			if msg.ToolCallID != "" {
+				label += " (tool_call_id=" + msg.ToolCallID + ")"
+			}
+			items = append(items, upstream.ContentItem{Type: "text", Text: label + " " + text})
 		}
 	}
 	return items
+}
+
+// formatAssistantToolCalls renders a previous assistant tool_calls turn as a
+// stable text fragment (id + name + arguments) that the upstream agent can
+// parse and correlate with the subsequent tool result.
+func formatAssistantToolCalls(calls []openaiToolCall) string {
+	var sb strings.Builder
+	sb.WriteString("[Assistant Tool Calls - issued earlier]\n")
+	for _, c := range calls {
+		sb.WriteString("  id=" + c.ID + " name=" + c.Function.Name)
+		if c.Function.Arguments != "" {
+			sb.WriteString(" arguments=" + c.Function.Arguments)
+		}
+		sb.WriteString("\n")
+	}
+	return sb.String()
 }
 
 func extractContent(raw json.RawMessage) string {
