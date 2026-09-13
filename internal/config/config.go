@@ -18,6 +18,8 @@ type Config struct {
 	MaxReqPerSession int                     `json:"max_req_per_session"`
 	UpstreamURL      string                  `json:"upstream_url"`
 	AgentPreset      string                  `json:"agent_preset"`
+	RequestJitterMs  int                     `json:"request_jitter_ms"` // pseudo-concurrency: random delay [0,N)ms before sending to upstream
+	MaxConcurrent    int                     `json:"max_concurrent"`     // cap of in-flight upstream requests (0 = unlimited)
 	ModelMap         map[string]ModelMapping `json:"model_map"`
 }
 
@@ -57,6 +59,8 @@ func defaultConfig() Config {
 		MaxReqPerSession: 200,
 		UpstreamURL:      "https://deepseek-harness.edgeone.cool",
 		AgentPreset:      "minimal",
+		RequestJitterMs:  0,
+		MaxConcurrent:    0,
 		ModelMap:         defaultModelMap(),
 	}
 }
@@ -109,6 +113,16 @@ func Load(path string) (Config, error) {
 	}
 	if v := os.Getenv("EDGEONE_API_UPSTREAM"); v != "" {
 		cfg.UpstreamURL = v
+	}
+	if v := os.Getenv("EDGEONE_API_JITTER_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.RequestJitterMs = n
+		}
+	}
+	if v := os.Getenv("EDGEONE_API_MAX_CONCURRENT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.MaxConcurrent = n
+		}
 	}
 	return cfg, nil
 }

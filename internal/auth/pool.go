@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"edgeone2api/internal/upstream"
@@ -36,10 +37,10 @@ type Session struct {
 	ReqCount       int // total requests served by this session (tool-less turns)
 	Client         *upstream.Client
 
-	mu            sync.Mutex // locks the session for exclusive use
-	active        bool       // guarded by mu
-	bound         bool       // true if this session is bound to a key (guarded by mu)
-	quotaExceeded bool       // set by MarkQuotaExceeded; fingerprint exhaustion is recorded on release
+	mu            sync.Mutex  // locks the session for exclusive use
+	active        atomic.Bool // set under mu by Lock; read atomically by Unlock/Stats
+	bound         bool        // true if this session is bound to a key (guarded by mu)
+	quotaExceeded bool        // set by MarkQuotaExceeded; fingerprint exhaustion is recorded on release
 
 	// SelectedModel caches the last selectModel payload so repeated requests
 	// with the same model skip the redundant RPC (guarded by mu).
@@ -49,13 +50,23 @@ type Session struct {
 // Lock locks the session for exclusive use
 func (s *Session) Lock() {
 	s.mu.Lock()
-	s.active = true
+	s.active.Store(true)
 	s.LastUsed = time.Now()
 }
 
-// Unlock unlocks the session
+// Unlock unlocks the session.  Idempotent: calling Unlock on an already
+// unlocked session is a no-op.  This guards against double-release when a
+// request's release closure is invoked more than once (e.g. an internal
+// error path plus the deferred release), which previously crashed with
+// "sync: unlock of unlocked mutex".
+//
+// The caller is expected to hold s.mu (from Lock/Bind/Acquire), so the
+// idempotency check uses an atomic flag instead of re-locking the mutex —
+// re-locking here would self-deadlock on the held mutex.
 func (s *Session) Unlock() {
-	s.active = false
+	if !s.active.CompareAndSwap(true, false) {
+		return // already released
+	}
 	s.mu.Unlock()
 }
 
@@ -454,26 +465,20 @@ func (p *Pool) ReleaseBind(key string, s *Session, success bool) {
 	exceeded := p.config.MaxReqPerSession > 0 && s.ReqCount >= p.config.MaxReqPerSession
 	failed := s.FailedCount >= 3
 
-	if !success && failed {
-		// Permanent failure — drop the binding so the next request
-		// with this key gets a brand-new session automatically.
-		p.mu.Lock()
-		delete(p.binds, key)
-		s.bound = false
-		p.mu.Unlock()
-		log.Printf("pool: dropped failed binding %s (session %s)", key, s.SessionID)
-	}
-	if exceeded {
-		// Rotate: remove the session from the binding so the next request
-		// with the same key creates a fresh session (new conversation id).
-		if s.quotaExceeded {
+	if failed || exceeded {
+		// Direct removal: a failed or quota-exceeded session is dropped
+		// entirely (binding + pool structures), never left as an orphan.
+		// The next request with this key creates a brand-new session
+		// (new conversation id + fresh browser fingerprint).
+		if exceeded && s.quotaExceeded {
 			p.exhaustFingerprint(s.Client.FingerprintSignature())
 		}
-		p.mu.Lock()
-		delete(p.binds, key)
-		s.bound = false
-		p.mu.Unlock()
-		log.Printf("pool: rotated session %s for key %s after %d requests", s.SessionID, key, s.ReqCount)
+		p.removeSession(s)
+		if exceeded {
+			log.Printf("pool: removed session %s for key %s after %d requests", s.SessionID, key, s.ReqCount)
+		} else {
+			log.Printf("pool: removed failed session %s for key %s", s.SessionID, key)
+		}
 		s.Unlock()
 		return
 	}
@@ -626,7 +631,7 @@ func (p *Pool) Stats() map[string]interface{} {
 	active, failed := 0, 0
 	for _, s := range sessions {
 		s.mu.Lock()
-		if s.active {
+		if s.active.Load() {
 			active++
 		}
 		if s.FailedCount > 0 {

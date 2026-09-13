@@ -1,0 +1,52 @@
+{
+  "listen": ":7863",
+  "api_key": "53c84ea4e286f2bd2f2c83ab7d0d36f5",
+  "models": [
+    "@makers/deepseek-v4-flash",
+    "@makers/deepseek-v4-pro",
+    "@makers/hy3",
+    "@makers/minimax-m3",
+    "@makers/kimi-k2.6"
+  ],
+  "pool_min": 4,
+  "pool_max": 32,
+  "ttl_minutes": 0,
+  "bind_ttl_minutes": 30,
+  "max_req_per_session": 200,
+  "upstream_url": "https://deepseek-harness.edgeone.cool",
+  "agent_preset": "minimal",
+  "model_map": {
+    "@makers/hy3": {
+      "provider": "edgeone-makers",
+      "model": "@makers/hy3"
+    },
+    "@makers/hy3-preview": {
+      "provider": "edgeone-makers",
+      "model": "@makers/hy3-preview"
+    },
+    "@makers/deepseek-v4-pro": {
+      "provider": "edgeone-makers",
+      "model": "@makers/deepseek-v4-pro",
+      "reasoning_effort": "high"
+    },
+    "@makers/deepseek-v4-flash": {
+      "provider": "edgeone-makers",
+      "model": "@makers/deepseek-v4-flash",
+      "reasoning_effort": "high"
+    },
+    "@makers/minimax-m3": {
+      "provider": "edgeone-makers",
+      "model": "@makers/minimax-m3"
+    },
+    "@makers/minimax-m2.7": {
+      "provider": "edgeone-makers",
+      "model": "@makers/minimax-m2.7"
+    },
+    "@makers/kimi-k2.6": {
+      "provider": "edgeone-makers",
+      "model": "@makers/kimi-k2.6"
+    }
+  },
+  "request_jitter_ms": 1500,
+  "max_concurrent": 4
+}

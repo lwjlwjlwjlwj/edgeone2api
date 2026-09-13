@@ -9,14 +9,40 @@ import (
 	"fmt"
 	"io"
 	"log"
+	mathrand "math/rand"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"edgeone2api/internal/auth"
 	"edgeone2api/internal/config"
 	"edgeone2api/internal/upstream"
 )
+
+// normalizeReasoningEffort maps client-supplied reasoning strength values to
+// the upstream's accepted set ("off", "high", "max").  OpenAI-standard
+// values (low/medium/high) and common aliases are normalized so downstream
+// clients can send reasoning_effort without hitting an upstream rejection:
+//
+//	low / medium / high  -> high   (lowest upstream on-state)
+//	max / extreme        -> max
+//	off / none / false   -> off
+//	anything else        -> ""    (unset: upstream default)
+func normalizeReasoningEffort(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "":
+		return ""
+	case "off", "none", "false", "0":
+		return "off"
+	case "low", "medium", "high":
+		return "high"
+	case "max", "extreme", "high-max":
+		return "max"
+	default:
+		return ""
+	}
+}
 
 // Server is an OpenAI-compatible API server backed by DeepSeek Harness sessions
 type Server struct {
@@ -25,23 +51,33 @@ type Server struct {
 	models   []string
 	timeout  time.Duration
 	modelMap map[string]config.ModelMapping
+	jitterMs int // pseudo-concurrency: random pre-send delay [0, jitterMs)
+	rng      *mathrand.Rand
+	rngMu    sync.Mutex
+	sem      chan struct{} // in-flight upstream request cap (nil = unlimited)
 }
 
 // New creates a new server
-func New(pool *auth.Pool, apiKey string, models []string, timeout time.Duration, modelMap map[string]config.ModelMapping) *Server {
+func New(pool *auth.Pool, apiKey string, models []string, timeout time.Duration, modelMap map[string]config.ModelMapping, jitterMs, maxConcurrent int) *Server {
 	if len(models) == 0 {
 		models = []string{"@makers/deepseek-v4-flash", "@makers/deepseek-v4-pro"}
 	}
 	if modelMap == nil {
 		modelMap = map[string]config.ModelMapping{}
 	}
-	return &Server{
+	s := &Server{
 		pool:     pool,
 		apiKey:   apiKey,
 		models:   models,
 		timeout:  timeout,
 		modelMap: modelMap,
+		jitterMs: jitterMs,
+		rng:      mathrand.New(mathrand.NewSource(time.Now().UnixNano())),
 	}
+	if maxConcurrent > 0 {
+		s.sem = make(chan struct{}, maxConcurrent)
+	}
+	return s
 }
 
 // Handler returns the HTTP handler
@@ -99,7 +135,8 @@ type openaiToolFunc struct {
 	Parameters  json.RawMessage `json:"parameters"`
 }
 
-// openaiToolCall mirrors the OpenAI tool_calls message field returned to the client
+// openaiToolCall mirrors the OpenAI tool_calls message field (parsed from
+// client history and returned to the client for execution).
 type openaiToolCall struct {
 	ID       string           `json:"id"`
 	Type     string           `json:"type"`
@@ -153,6 +190,35 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[CHAT] model=%s stream=%v msgs=%d", model, req.Stream, len(req.Messages))
 
+	// Pseudo-concurrency: spread concurrent requests with a random delay so
+	// they don't hit the upstream in the same instant (its rate limiter trips
+	// on simultaneous session.prompt bursts and returns 502/timeouts).
+	// Applied before session acquisition so the delay doesn't hold a session.
+	if s.jitterMs > 0 {
+		s.rngMu.Lock()
+		d := time.Duration(s.rng.Intn(s.jitterMs)) * time.Millisecond
+		s.rngMu.Unlock()
+		if d > 0 {
+			time.Sleep(d)
+		}
+	}
+
+	// Concurrency gate: cap in-flight upstream requests so a burst of client
+	// concurrency never overloads the upstream (it degrades to 502/timeouts
+	// under sustained parallel load).  Excess requests queue here; from the
+	// client's perspective the requests still complete, just slightly later.
+	// Waits on the client connection context, not the 180s upstream timeout,
+	// so queueing time does not eat into the per-request upstream budget.
+	if s.sem != nil {
+		select {
+		case s.sem <- struct{}{}:
+			defer func() { <-s.sem }()
+		case <-r.Context().Done():
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": map[string]any{"message": "server busy, retry later", "type": "server_error"}})
+			return
+		}
+	}
+
 	// Session affinity: a client that sends X-Session-Key gets a bound,
 	// stateful session for continuity.  Anonymous requests (no header) use a
 	// stateless free-pool session and release it afterwards, so they can not
@@ -187,15 +253,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		// Fallback: treat the model string as-is with edgeone-makers provider
 		mm = config.ModelMapping{Provider: "edgeone-makers", Model: model}
 	}
-	selKey := mm.Provider + "/" + mm.Model + "/" + mm.ReasoningEffort
-	if req.ReasoningEffort != "" {
-		selKey = mm.Provider + "/" + mm.Model + "/" + req.ReasoningEffort
+	re := normalizeReasoningEffort(req.ReasoningEffort)
+	if re == "" {
+		re = normalizeReasoningEffort(mm.ReasoningEffort)
 	}
+	selKey := mm.Provider + "/" + mm.Model + "/" + re
 	if session.SelectedModel != selKey {
-		re := req.ReasoningEffort
-		if re == "" {
-			re = mm.ReasoningEffort
-		}
 		if err := session.Client.SelectModel(ctx, session.SessionID, session.ConversationID, mm.Provider, mm.Model, re); err != nil {
 			log.Printf("[SELECTMODEL] %s: %v", selKey, err)
 		} else {
@@ -207,15 +270,20 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	chatID := "chatcmpl-" + randHex(24)
 	created := time.Now().Unix()
 
+	// Dual mode (workbuddy2api-style tool aggregation):
+	//   - No tools declared -> kuku2api-style plain text (content + reasoning,
+	//     no tool_calls ever).
+	//   - Tools declared    -> the model declares tool_calls via the
+	//     ToolForge JSON-text protocol; the gateway parses them and returns
+	//     standard OpenAI tool_calls to the client for execution.  The EdgeOne
+	//     sandbox is never invoked (directive forbids native tools / agent
+	//     loop, and the SSE stream is cancelled as soon as the turn ends).
+	//     Tool results come back as follow-up role=tool messages.
 	toolsJSON := ""
-	declared := declaredToolSet{}
 	textOnly := len(req.Tools) == 0
 	if len(req.Tools) > 0 {
 		if b, err := json.Marshal(req.Tools); err == nil {
 			toolsJSON = string(b)
-		}
-		for _, t := range req.Tools {
-			declared[t.Function.Name] = t
 		}
 	}
 
@@ -225,42 +293,18 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				return s.pool.Bind(ctx, sessionKey)
 			}
 			return s.pool.Acquire(ctx)
-		}, toolsJSON, declared, textOnly)
+		}, toolsJSON, textOnly)
 	} else {
 		s.nonStreamChat(w, ctx, session, chatID, model, created, req.Messages, sessionKey, release, func(ctx context.Context) (*auth.Session, error) {
 			if bound {
 				return s.pool.Bind(ctx, sessionKey)
 			}
 			return s.pool.Acquire(ctx)
-		}, toolsJSON, declared, textOnly)
+		}, toolsJSON, textOnly)
 	}
 }
 
-// toOpenAIToolCalls converts upstream-native assistant tool calls into the
-// OpenAI tool_calls message shape returned to the client.
-func toOpenAIToolCalls(tcs []upstream.AssistantToolCall) []openaiToolCall {
-	if len(tcs) == 0 {
-		return nil
-	}
-	calls := make([]openaiToolCall, 0, len(tcs))
-	for i, tc := range tcs {
-		id := tc.ID
-		if id == "" {
-			id = fmt.Sprintf("call_%s_%d", randHex(6), i)
-		}
-		calls = append(calls, openaiToolCall{
-			ID:   id,
-			Type: "function",
-			Function: openaiToolCallFn{
-				Name:      tc.Name,
-				Arguments: tc.Arguments,
-			},
-		})
-	}
-	return calls
-}
-
-func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, msgs []openaiMessage, sessionKey string, release func(bool), reacquire func(context.Context) (*auth.Session, error), toolsJSON string, declared declaredToolSet, textOnly bool) {
+func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, msgs []openaiMessage, sessionKey string, release func(bool), reacquire func(context.Context) (*auth.Session, error), toolsJSON string, textOnly bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		release(false)
@@ -314,10 +358,15 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 		var sb strings.Builder
 		var result upstream.ChatResult
 		var streamErr error
-		// nativeToolCalls tracks whether upstream emitted real tool-call events
-		// mid-stream (vs. the mode-B text protocol parsed after the turn).
-		nativeToolCall := false
-		toolSeen := make(map[int]bool) // index -> name delta sent
+		toolSeen := make(map[int]bool) // tool-call index -> first (name/id) delta already sent
+
+		// Cancel the SSE stream as soon as this turn ends.  The upstream agent
+		// loop (EdgeOne sandbox tool execution) only starts after turn/end; a
+		// cancelled stream cuts it off — the sandbox never runs.  This is the
+		// enforcement half of the "tools run on the client, not in the sandbox"
+		// design; the directive (BuildDirective) is the prevention half.
+		defer cs.Cancel()
+
 		result, streamErr = session.Client.StreamEvents(ctx, cs, func(chunk upstream.AssistantChunk) {
 			if chunk.IsDone {
 				return // finish chunk is emitted after StreamEvents returns
@@ -331,10 +380,10 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 			if chunk.Reasoning != "" {
 				delta["reasoning_content"] = chunk.Reasoning
 			}
-			if chunk.ToolCall != nil {
+			if chunk.ToolCall != nil && !textOnly {
 				tc := chunk.ToolCall
-				nativeToolCall = true
 				if tc.Name != "" && !toolSeen[tc.Index] {
+					// First delta for this tool call: id/type/name + any argument text.
 					toolSeen[tc.Index] = true
 					delta["role"] = "assistant"
 					delta["content"] = nil
@@ -342,14 +391,16 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 						"index":    tc.Index,
 						"id":       tc.ID,
 						"type":     "function",
-						"function": map[string]any{"name": translateToolCallName(tc.Name, declared), "arguments": tc.ArgumentsDelta},
+						"function": map[string]any{"name": tc.Name, "arguments": tc.ArgumentsDelta},
 					}}
 				} else if tc.ArgumentsDelta != "" {
+					// Streaming argument fragment for an already-announced call.
 					delta["tool_calls"] = []any{map[string]any{
 						"index":    tc.Index,
 						"function": map[string]any{"arguments": tc.ArgumentsDelta},
 					}}
 				} else if tc.IsComplete && tc.Arguments != "" {
+					// Final block-end: full arguments (authoritative replacement).
 					delta["tool_calls"] = []any{map[string]any{
 						"index":    tc.Index,
 						"function": map[string]any{"arguments": tc.Arguments},
@@ -362,7 +413,23 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 			}
 		}, textOnly)
 		logTools(sessionKey, result.ToolCalls)
-		finishReason := "stop"
+		finishReason := result.FinishReason
+		if finishReason == "" {
+			finishReason = "stop"
+		}
+		// Streaming fallback for the ToolForge JSON-text protocol: when the
+		// model answered with a tool_calls JSON as plain text (no native
+		// tool-call blocks), the JSON already streamed out as content.  Emit
+		// the parsed tool_calls as a final delta so OpenAI clients see a
+		// structured tool_calls turn and finish_reason=tool_calls, matching
+		// the non-streaming aggregation.
+		if !textOnly && finishReason != "tool_calls" {
+			if calls := parseToolCalls(sb.String()); calls != nil {
+				emitToolCallsSSE(w, chatID, model, created, calls)
+				flusher.Flush()
+				finishReason = "tool_calls"
+			}
+		}
 		if streamErr != nil {
 			log.Printf("[STREAM] error: %v", streamErr)
 			success = false
@@ -370,15 +437,6 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 			success = true
 			if sessionKey != "" {
 				s.pool.AppendHistory(sessionKey, session.SessionID, userText, sb.String())
-			}
-			if !textOnly {
-				if nativeToolCall || len(result.ToolCalls) > 0 {
-					finishReason = "tool_calls"
-				} else if calls := parseToolCalls(sb.String()); calls != nil {
-					emitToolCallsSSE(w, chatID, model, created, translateToolCalls(calls, declared))
-					flusher.Flush()
-					finishReason = "tool_calls"
-				}
 			}
 		}
 
@@ -391,7 +449,7 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 	writeJSON(w, http.StatusBadGateway, map[string]any{"error": "upstream quota exceeded, retry later"})
 }
 
-func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, msgs []openaiMessage, sessionKey string, release func(bool), reacquire func(context.Context) (*auth.Session, error), toolsJSON string, declared declaredToolSet, textOnly bool) {
+func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, msgs []openaiMessage, sessionKey string, release func(bool), reacquire func(context.Context) (*auth.Session, error), toolsJSON string, textOnly bool) {
 	var result upstream.ChatResult
 	var err error
 
@@ -416,6 +474,11 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": "upstream error: " + err.Error(), "type": "upstream_error"}})
 			return
 		}
+		// Cancel the SSE stream as soon as the turn ends: the upstream agent
+		// loop (EdgeOne sandbox execution) would only run after turn/end, and
+		// a cancelled stream cuts it off.  Tools execute on the client, never
+		// in the sandbox.
+		defer cs.Cancel()
 		result, err = session.Client.StreamEvents(ctx, cs, nil, textOnly)
 		logTools(sessionKey, result.ToolCalls)
 		if err != nil {
@@ -440,15 +503,17 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 	}
 	finish := "stop"
 	if !textOnly {
-		// Prefer the upstream-native tool calls (real tool-call events), falling
-		// back to the declared-tool JSON text protocol when the model emitted a
-		// tool_calls JSON as plain text instead.  Both paths go through the tool
-		// translation layer so tool names match the client's declared set.
-		if calls := translateToolCalls(toOpenAIToolCalls(result.ToolCalls), declared); len(calls) > 0 {
+		// workbuddy2api-style tool aggregation: prefer upstream-native
+		// tool-call events (real tool-call blocks), falling back to the
+		// ToolForge JSON-text protocol (the model declares a tool_calls JSON
+		// as plain text).  Names pass through untouched — no translation.
+		// The calls are returned to the client for execution; the EdgeOne
+		// sandbox never runs them.
+		if calls := toOpenAIToolCalls(result.ToolCalls); len(calls) > 0 {
 			msg["content"] = nil
 			msg["tool_calls"] = calls
 			finish = "tool_calls"
-		} else if calls := translateToolCalls(parseToolCalls(result.Text), declared); calls != nil {
+		} else if calls := parseToolCalls(result.Text); calls != nil {
 			msg["content"] = nil
 			msg["tool_calls"] = calls
 			finish = "tool_calls"
@@ -481,11 +546,12 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 
 // --- Message conversion ---
 
-// buildItems assembles the prompt for a session: the tool-definition
-// directive (with declared tools when any), an optional cache-hit replay of
-// the previous dialog history, then the request messages.  Replay is
-// recomputed per session so a fresh session created by a quota retry inherits
-// the cached context automatically.
+// buildItems assembles the prompt for a session: the system directive
+// (plain-text posture, or ToolForge tool-declaration protocol when the client
+// declared tools), an optional cache-hit replay of the previous dialog
+// history, then the request messages.  Replay is recomputed per session so a
+// fresh session created by a quota retry inherits the cached context
+// automatically.
 func (s *Server) buildItems(session *auth.Session, sessionKey string, msgs []openaiMessage, toolsJSON string) []upstream.ContentItem {
 	items := []upstream.ContentItem{{Type: "text", Text: upstream.BuildDirective(toolsJSON)}}
 	if sessionKey != "" {
@@ -531,7 +597,7 @@ func convertMessages(msgs []openaiMessage) []upstream.ContentItem {
 				items = append(items, upstream.ContentItem{Type: "text", Text: text})
 			}
 			// Preserve a previous tool_calls turn as fenced text so the
-			// upstream agent sees which tool-call was issued (with its id),
+			// upstream model sees which tool-call was issued (with its id),
 			// enabling it to match a later tool result and continue.
 			if len(msg.ToolCalls) > 0 {
 				items = append(items, upstream.ContentItem{Type: "text", Text: formatAssistantToolCalls(msg.ToolCalls)})
@@ -556,20 +622,29 @@ func convertMessages(msgs []openaiMessage) []upstream.ContentItem {
 	return items
 }
 
-// formatAssistantToolCalls renders a previous assistant tool_calls turn as a
-// stable text fragment (id + name + arguments) that the upstream agent can
-// parse and correlate with the subsequent tool result.
-func formatAssistantToolCalls(calls []openaiToolCall) string {
-	var sb strings.Builder
-	sb.WriteString("[Assistant Tool Calls - issued earlier]\n")
-	for _, c := range calls {
-		sb.WriteString("  id=" + c.ID + " name=" + c.Function.Name)
-		if c.Function.Arguments != "" {
-			sb.WriteString(" arguments=" + c.Function.Arguments)
-		}
-		sb.WriteString("\n")
+// toOpenAIToolCalls converts upstream-native assistant tool calls into the
+// OpenAI tool_calls message shape returned to the client.  Names pass
+// through untouched (workbuddy2api style — no translation layer).
+func toOpenAIToolCalls(tcs []upstream.AssistantToolCall) []openaiToolCall {
+	if len(tcs) == 0 {
+		return nil
 	}
-	return sb.String()
+	calls := make([]openaiToolCall, 0, len(tcs))
+	for i, tc := range tcs {
+		id := tc.ID
+		if id == "" {
+			id = fmt.Sprintf("call_%s_%d", randHex(6), i)
+		}
+		calls = append(calls, openaiToolCall{
+			ID:   id,
+			Type: "function",
+			Function: openaiToolCallFn{
+				Name:      tc.Name,
+				Arguments: tc.Arguments,
+			},
+		})
+	}
+	return calls
 }
 
 func extractContent(raw json.RawMessage) string {
@@ -625,10 +700,26 @@ func logTools(sessionKey string, calls []upstream.AssistantToolCall) {
 	}
 }
 
+// formatAssistantToolCalls renders a previous assistant tool_calls turn as a
+// stable text fragment (id + name + arguments) that the upstream model can
+// parse and correlate with the subsequent tool result.
+func formatAssistantToolCalls(calls []openaiToolCall) string {
+	var sb strings.Builder
+	sb.WriteString("[Assistant Tool Calls - issued earlier]\n")
+	for _, c := range calls {
+		sb.WriteString("  id=" + c.ID + " name=" + c.Function.Name)
+		if c.Function.Arguments != "" {
+			sb.WriteString(" arguments=" + c.Function.Arguments)
+		}
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
 // parseToolCalls tries to interpret the model's text output as a tool_calls
-// JSON (the declared-tool protocol).  It tolerates a surrounding code
-// fence.  Returns nil when the text is not a tool_calls JSON, meaning the
-// model answered directly.
+// JSON (the ToolForge declared-tool protocol).  It tolerates a surrounding
+// code fence.  Returns nil when the text is not a tool_calls JSON, meaning
+// the model answered directly.
 func parseToolCalls(text string) []openaiToolCall {
 	t := strings.TrimSpace(text)
 	t = strings.TrimPrefix(t, "```json")
@@ -696,22 +787,9 @@ func emitSSE(w http.ResponseWriter, chatID, model string, created int64, delta m
 	w.Write([]byte("data: " + string(d) + "\n\n"))
 }
 
-func emitFinish(w http.ResponseWriter, chatID, model string, created int64, finish string) {
-	out := map[string]any{
-		"id":      chatID,
-		"model":   model,
-		"created": created,
-		"object":  "chat.completion.chunk",
-		"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": finish}},
-	}
-	d, _ := json.Marshal(out)
-	w.Write([]byte("data: " + string(d) + "\n\n"))
-	w.Write([]byte("data: [DONE]\n\n"))
-}
-
-// emitToolCallsSSE sends the complete tool_calls payload as a streaming chunk
-// with finish_reason="tool_calls", so streaming clients get the same
-// tool_calls contract as the non-streaming path.
+// emitToolCallsSSE sends the complete tool_calls payload as a streaming chunk.
+// Used by the streaming fallback when the model declared tool_calls via the
+// ToolForge JSON-text protocol instead of native tool-call blocks.
 func emitToolCallsSSE(w http.ResponseWriter, chatID, model string, created int64, calls []openaiToolCall) {
 	delta := map[string]any{
 		"role":       "assistant",
@@ -727,6 +805,19 @@ func emitToolCallsSSE(w http.ResponseWriter, chatID, model string, created int64
 	}
 	d, _ := json.Marshal(out)
 	w.Write([]byte("data: " + string(d) + "\n\n"))
+}
+
+func emitFinish(w http.ResponseWriter, chatID, model string, created int64, finish string) {
+	out := map[string]any{
+		"id":      chatID,
+		"model":   model,
+		"created": created,
+		"object":  "chat.completion.chunk",
+		"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": finish}},
+	}
+	d, _ := json.Marshal(out)
+	w.Write([]byte("data: " + string(d) + "\n\n"))
+	w.Write([]byte("data: [DONE]\n\n"))
 }
 
 // --- Health / Pool ---

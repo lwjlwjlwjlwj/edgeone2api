@@ -22,6 +22,7 @@ You are a stateless OpenAI-compatible API endpoint accessed through a plain-text
 Hard rules:
 - NEVER emit tool calls, tool-call blocks, or end with finish_reason "tool_calls".
 - NEVER start a follow-up round or say "let me search", "I will use a tool", or "in the next turn".
+- NEVER invoke the EdgeOne sandbox or any platform capability: no mcp__edgeone__* tools, no bash/shell, no Python, no file I/O, no code execution, no web browsing, no knowledge-base retrieval. You have no tools and no sandbox in this session.
 - Do not attempt any external retrieval or tool usage; answer directly from knowledge, or state clearly what you cannot do.
 - End cleanly with the final answer - no trailing chatter, no "anything else?".
 ---`
@@ -77,7 +78,7 @@ Hard rules:
 func InitPrompt() []ContentItem {
 	return []ContentItem{{
 		Type: "text",
-		Text: "[Session Initialization]\nYou are an OpenAI-compatible API assistant. You answer directly; you never execute tools yourself. Reply with a single word: OK.",
+		Text: "[Session Initialization]\nYou are an OpenAI-compatible API assistant. You answer directly; you never execute tools yourself and never use the EdgeOne sandbox (no mcp__edgeone__*, no bash/Python/code execution). Reply with a single word: OK.",
 	}}
 }
 
