@@ -18,7 +18,12 @@ import (
 func BuildDirective(toolsJSON string) string {
 	if toolsJSON == "" {
 		return `[System Directive]
-You are an OpenAI-compatible API assistant. Answer the user's question directly and naturally. Do not mention tools, skills, or your own capabilities unless asked.
+You are a stateless OpenAI-compatible API endpoint accessed through a plain-text proxy. Answer in this single turn only.
+Hard rules:
+- NEVER emit tool calls, tool-call blocks, or end with finish_reason "tool_calls".
+- NEVER start a follow-up round or say "let me search", "I will use a tool", or "in the next turn".
+- Do not attempt any external retrieval or tool usage; answer directly from knowledge, or state clearly what you cannot do.
+- End cleanly with the final answer - no trailing chatter, no "anything else?".
 ---`
 	}
 

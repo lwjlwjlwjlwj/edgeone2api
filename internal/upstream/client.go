@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"net/http"
 	"strings"
@@ -514,7 +515,7 @@ func (c *Client) InitSession(ctx context.Context, sessionID, convID string) erro
 		return err
 	}
 	defer cs.Cancel()
-	_, err = c.StreamEvents(ctx, cs, nil)
+	_, err = c.StreamEvents(ctx, cs, nil, false)
 	return err
 }
 
@@ -527,14 +528,23 @@ func (cs *ChatStream) Cancel() {
 
 // StreamEvents consumes the SSE event stream, yielding deltas via onDelta,
 // until the turn ends. Returns the accumulated result.
+//
+// When textOnly is true (kuku2api-style plain-text proxy mode), tool-call
+// events are folded away: native tool blocks are dropped, the finish reason
+// is normalized to "stop", and a tool-driven turn does not terminate the
+// round — the stream keeps being consumed so any follow-up text produced by
+// the upstream agent loop can still flow through. The client therefore never
+// sees a bare tool_calls chunk or a blank agent-loop reply.
+//
 // ctx can be used for timeout; nil means no deadline.
-func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(AssistantChunk)) (ChatResult, error) {
+func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(AssistantChunk), textOnly bool) (ChatResult, error) {
 	var sb strings.Builder
 	var reasoningSb strings.Builder
 	var turn int
 	finishReason := "stop"
 	toolCalls := make(map[int]*AssistantToolCall)
 	var toolCallOrder []int // preserves the order tool calls first appear
+	droppedTools := false   // textOnly: a tool-call was folded this turn
 
 	result := func() ChatResult {
 		ordered := make([]AssistantToolCall, 0, len(toolCallOrder))
@@ -568,6 +578,7 @@ func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(
 				}
 				json.Unmarshal(se.Event.Data, &d)
 				turn = d.Turn
+				droppedTools = false
 
 			case "assistant/chunk":
 				if turn == 0 {
@@ -613,8 +624,15 @@ func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(
 						BlockType string `json:"blockType"`
 					}
 					json.Unmarshal(d.Chunk, &cd)
-					if cd.BlockType == "tool-call" && onDelta != nil {
-						onDelta(AssistantChunk{ToolCall: &AssistantToolCall{}})
+					if cd.BlockType == "tool-call" {
+						if textOnly {
+							droppedTools = true
+							log.Printf("[STREAM] textOnly: dropping tool-call block")
+							continue
+						}
+						if onDelta != nil {
+							onDelta(AssistantChunk{ToolCall: &AssistantToolCall{}})
+						}
 					}
 				case "tool-call-delta":
 					var cd struct {
@@ -624,6 +642,10 @@ func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(
 						ArgumentsDelta string `json:"argumentsDelta"`
 					}
 					json.Unmarshal(d.Chunk, &cd)
+					if textOnly {
+						droppedTools = true
+						continue
+					}
 					tc := toolCalls[cd.Index]
 					if tc == nil {
 						tc = &AssistantToolCall{Index: cd.Index}
@@ -663,6 +685,12 @@ func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(
 						} `json:"block"`
 					}
 					json.Unmarshal(d.Chunk, &cd)
+					if textOnly {
+						if cd.Block != nil && cd.Block.Type == "tool-call" {
+							droppedTools = true
+						}
+						continue
+					}
 					if cd.Block != nil && cd.Block.Type == "tool-call" {
 						if tc, ok := toolCalls[cd.Index]; ok && cd.Block.Arguments != "" {
 							tc.Arguments = cd.Block.Arguments
@@ -688,7 +716,7 @@ func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(
 						} `json:"reason"`
 					}
 					json.Unmarshal(d.Chunk, &cd)
-					if cd.Reason.Kind == "tool-calls" {
+					if cd.Reason.Kind == "tool-calls" && !textOnly {
 						finishReason = "tool_calls"
 					}
 				}
@@ -699,6 +727,9 @@ func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(
 				}
 				json.Unmarshal(se.Event.Data, &d)
 				if turn > 0 && d.Turn == turn {
+					if textOnly && droppedTools {
+						continue // tool-driven turn: keep consuming follow-up turns
+					}
 					if onDelta != nil {
 						onDelta(AssistantChunk{IsDone: true, FinishReason: finishReason})
 					}

@@ -13,6 +13,7 @@
 - **弹性凭证池** — 会话池自动创建/复用/维护，配额感知轮换（绕过单一会话的用量上限）；会话不足时并发后台扩容，突发请求不排队
 - **SSE 流式** — 流式透传上游事件流；非流式自动聚合 `content`
 - **工具调用** — 原生支持 OpenAI `tools` 参数：客户端声明的工具定义注入系统指令，模型首轮即以 JSON 文本声明工具调用，网关强校验解析为标准 `tool_calls` 返回（ToolForge 风格，首轮截断，一次 LLM 调用即可闭环）；`role:"tool"` 结果回传后自然续接
+- **纯文本模式（对齐 kuku2api）** — 未传 `tools` 的请求按 kuku2api 思路以纯文本黑盒处理：折叠上游一切工具事件、工具驱动的轮次自动续读、`finish_reason` 归一为 `stop`，绝不向客户端泄漏工具协议（无白屏/空回复）
 - **可选鉴权** — 配置 `api_key` 后需 Bearer token 访问
 - **Go 单二进制** — 无外部依赖，`go build` 即得
 
@@ -163,6 +164,23 @@ curl -s http://localhost:7863/v1/chat/completions \
 按别名映射表重写为客户端实际声明的工具名；已匹配或无法映射的名字原样透传（并输出告警日志）。
 同时系统指令会约束模型「只使用声明列表中的工具名」，从源头降低翻译需求。
 
+## 纯文本模式（无 tools 请求）
+
+未传 `tools` 的请求走**纯文本模式**，完整对齐 [kuku2api](https://github.com/xinxinshuhao-create/kuku2api)
+「把上游 agent 当纯文本黑盒」的思路：
+
+- 上游回车内出现 `block-start`(tool-call) / `tool-call-delta` / `block-end` 等工具事件时，
+  客户端流直接**折叠丢弃**（服务端日志可见 `textOnly: dropping tool-call block`）
+- 工具驱动的轮次**不会终止对话**——`turn/end` 时若本轮仅发生了被丢弃的工具调用，
+  自动续读后续轮次，直到模型输出真正的正文
+- `finish_reason` 统一归一为 `stop`，绝不输出 `tool_calls`；配合直答指令
+  （"单轮收敛、禁止工具调用"）从源头抑制上游 agent loop
+- 效果：无工具请求永远得到一段完整的纯文本回答，**不会白屏、不会空回复**，
+  与 OpenAI 普通 chat 行为完全一致
+
+这也意味着：客户端声明 `tools` 时获得完整工具调用能力；不声明时获得纯净的对话体验，
+二者互不干扰。
+
 ### 会话池扩容
 
 会话池在 `pool_min`（默认 4）~ `pool_max`（默认 32）之间弹性伸缩：
@@ -207,17 +225,37 @@ edgeone2api/
 │   ├── auth/pool.go              # 会话池：创建/绑定/轮换/并发预热扩容（核心）
 │   ├── auth/pool_test.go         # 会话池单测（含并发扩容回归）
 │   ├── config/config.go          # 配置加载 + model_map + env override
-│   ├── upstream/client.go        # Harness RPC 客户端 + 浏览器指纹 + SSE 读取
-│   ├── upstream/directive.go     # 工具定义注入指令（ToolForge 风格，首轮声明工具调用）
-│   ├── server/server.go          # OpenAI 兼容 handler + 流式/非流式 + 工具调用
+│   ├── upstream/client.go        # Harness RPC 客户端 + 浏览器指纹 + SSE 读取 + textOnly 折叠
+│   ├── upstream/client_test.go   # textOnly 折叠/续读/归一 + 指令注入单测
+│   ├── upstream/directive.go     # 工具定义注入指令（ToolForge 风格）+ 纯文本直答指令
+│   ├── server/server.go          # OpenAI 兼容 handler + 流式/非流式 + 工具调用 + textOnly 接线
 │   ├── server/tools.go           # 工具名翻译层（上游原生名 → 客户端声明名）
 │   ├── server/tools_test.go      # 翻译层单测
 │   └── toolcall/                 # 可选的工具调用中间件（独立部署）
 ├── config.example.json
+├── scripts/                   # 真实场景验证脚本（见下节）
+│   ├── gen_demo_data.py       # 演示数据生成（sales.csv / inventory_notes.txt）
+│   ├── verify_longctx.py      # 长上下文 + 多轮会话连续性验证
+│   └── verify_tools.py        # 复杂工具调用矩阵验证（S1-S6）
 ├── Dockerfile
 ├── docker-compose.yml
 └── go.mod
 ```
+
+## 真实场景验证
+
+验证不依赖 mock——直接请求真实上游 `deepseek-harness.edgeone.cool`，模型为
+`@makers/deepseek-v4-flash`。脚本：
+
+```bash
+python3 scripts/gen_demo_data.py   # 生成演示数据到 /tmp/kuku2api_demo/
+python3 scripts/verify_longctx.py  # 长上下文：6527 字符文档 + 5 轮增量对话（仅发新消息），10/10 通过
+python3 scripts/verify_tools.py    # 工具调用矩阵：S1-S6，18/18 断言通过
+```
+
+`verify_tools.py` 覆盖：非流式/流式、多轮链式工具闭环（read_file → calculate →
+`role:"tool"` 回传续接）、工具名翻译（声明 `read_text`/`run_calc`）、长上下文 + 跨文件推理、
+以及纯文本模式防泄漏（无 tools 请求 `finish_reason=stop`、零 tool_calls 泄漏、正文不白屏）。
 
 ## 免责声明
 

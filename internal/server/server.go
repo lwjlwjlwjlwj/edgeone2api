@@ -209,6 +209,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	toolsJSON := ""
 	declared := declaredToolSet{}
+	textOnly := len(req.Tools) == 0
 	if len(req.Tools) > 0 {
 		if b, err := json.Marshal(req.Tools); err == nil {
 			toolsJSON = string(b)
@@ -224,14 +225,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				return s.pool.Bind(ctx, sessionKey)
 			}
 			return s.pool.Acquire(ctx)
-		}, toolsJSON, declared)
+		}, toolsJSON, declared, textOnly)
 	} else {
 		s.nonStreamChat(w, ctx, session, chatID, model, created, req.Messages, sessionKey, release, func(ctx context.Context) (*auth.Session, error) {
 			if bound {
 				return s.pool.Bind(ctx, sessionKey)
 			}
 			return s.pool.Acquire(ctx)
-		}, toolsJSON, declared)
+		}, toolsJSON, declared, textOnly)
 	}
 }
 
@@ -259,7 +260,7 @@ func toOpenAIToolCalls(tcs []upstream.AssistantToolCall) []openaiToolCall {
 	return calls
 }
 
-func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, msgs []openaiMessage, sessionKey string, release func(bool), reacquire func(context.Context) (*auth.Session, error), toolsJSON string, declared declaredToolSet) {
+func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, msgs []openaiMessage, sessionKey string, release func(bool), reacquire func(context.Context) (*auth.Session, error), toolsJSON string, declared declaredToolSet, textOnly bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		release(false)
@@ -359,7 +360,7 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 				emitSSE(w, chatID, model, created, delta)
 				flusher.Flush()
 			}
-		})
+		}, textOnly)
 		logTools(sessionKey, result.ToolCalls)
 		finishReason := "stop"
 		if streamErr != nil {
@@ -370,12 +371,14 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 			if sessionKey != "" {
 				s.pool.AppendHistory(sessionKey, session.SessionID, userText, sb.String())
 			}
-			if nativeToolCall || len(result.ToolCalls) > 0 {
-				finishReason = "tool_calls"
-			} else if calls := parseToolCalls(sb.String()); calls != nil {
-				emitToolCallsSSE(w, chatID, model, created, translateToolCalls(calls, declared))
-				flusher.Flush()
-				finishReason = "tool_calls"
+			if !textOnly {
+				if nativeToolCall || len(result.ToolCalls) > 0 {
+					finishReason = "tool_calls"
+				} else if calls := parseToolCalls(sb.String()); calls != nil {
+					emitToolCallsSSE(w, chatID, model, created, translateToolCalls(calls, declared))
+					flusher.Flush()
+					finishReason = "tool_calls"
+				}
 			}
 		}
 
@@ -388,7 +391,7 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 	writeJSON(w, http.StatusBadGateway, map[string]any{"error": "upstream quota exceeded, retry later"})
 }
 
-func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, msgs []openaiMessage, sessionKey string, release func(bool), reacquire func(context.Context) (*auth.Session, error), toolsJSON string, declared declaredToolSet) {
+func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, msgs []openaiMessage, sessionKey string, release func(bool), reacquire func(context.Context) (*auth.Session, error), toolsJSON string, declared declaredToolSet, textOnly bool) {
 	var result upstream.ChatResult
 	var err error
 
@@ -413,7 +416,7 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": "upstream error: " + err.Error(), "type": "upstream_error"}})
 			return
 		}
-		result, err = session.Client.StreamEvents(ctx, cs, nil)
+		result, err = session.Client.StreamEvents(ctx, cs, nil, textOnly)
 		logTools(sessionKey, result.ToolCalls)
 		if err != nil {
 			log.Printf("[CHAT] stream error: %v", err)
@@ -436,18 +439,20 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 		msg["reasoning_content"] = result.Reasoning
 	}
 	finish := "stop"
-	// Prefer the upstream-native tool calls (real tool-call events), falling
-	// back to the declared-tool JSON text protocol when the model emitted a
-	// tool_calls JSON as plain text instead.  Both paths go through the tool
-	// translation layer so tool names match the client's declared set.
-	if calls := translateToolCalls(toOpenAIToolCalls(result.ToolCalls), declared); len(calls) > 0 {
-		msg["content"] = nil
-		msg["tool_calls"] = calls
-		finish = "tool_calls"
-	} else if calls := translateToolCalls(parseToolCalls(result.Text), declared); calls != nil {
-		msg["content"] = nil
-		msg["tool_calls"] = calls
-		finish = "tool_calls"
+	if !textOnly {
+		// Prefer the upstream-native tool calls (real tool-call events), falling
+		// back to the declared-tool JSON text protocol when the model emitted a
+		// tool_calls JSON as plain text instead.  Both paths go through the tool
+		// translation layer so tool names match the client's declared set.
+		if calls := translateToolCalls(toOpenAIToolCalls(result.ToolCalls), declared); len(calls) > 0 {
+			msg["content"] = nil
+			msg["tool_calls"] = calls
+			finish = "tool_calls"
+		} else if calls := translateToolCalls(parseToolCalls(result.Text), declared); calls != nil {
+			msg["content"] = nil
+			msg["tool_calls"] = calls
+			finish = "tool_calls"
+		}
 	}
 
 	resp := map[string]any{
