@@ -315,3 +315,73 @@ func TestAcquireScalesUnderBurst(t *testing.T) {
 		t.Fatalf("expected %d free sessions after release, got %d", burst, got)
 	}
 }
+
+// Regression: a bare s.mu.TryLock() in the checkout paths (Acquire/Bind) left
+// the session's `active` flag false, so the matching Unlock()'s CAS returned
+// early and the mutex was never released.  The first request on a bound key
+// succeeded; every subsequent one blocked in Bind() forever.  tryLock() must
+// mark the session active so Release/ReleaseBind can release it.
+func TestCheckoutSetsActiveFlag(t *testing.T) {
+	for _, name := range []string{"acquire", "bind"} {
+		s := &Session{SessionID: "s1", ConversationID: "c1", CreatedAt: time.Now()}
+		if !s.tryLock() {
+			t.Fatalf("%s: tryLock failed", name)
+		}
+		if !s.active.Load() {
+			t.Fatalf("%s: tryLock must set active=true (Unlock gates on it)", name)
+		}
+		s.Unlock()
+		if s.active.Load() {
+			t.Fatalf("%s: Unlock must clear active", name)
+		}
+		if !s.mu.TryLock() {
+			t.Fatalf("%s: mutex leaked — still held after Unlock", name)
+		}
+		s.mu.Unlock()
+	}
+}
+
+// Regression: ReleaseBind must actually free the mutex of the session handed
+// to it, and a second Bind round-trip on the same key must not deadlock.
+// (Guard against reintroducing raw TryLock() in the checkout paths.)
+func TestBindReleaseRoundTripDoesNotLeakLock(t *testing.T) {
+	p := testPool()
+	const key = "k"
+	s1, err := p.Bind(context.Background(), key)
+	if err != nil {
+		t.Fatalf("first bind: %v", err)
+	}
+	p.ReleaseBind(key, s1, true)
+	s2, err := p.Bind(context.Background(), key)
+	if err != nil {
+		t.Fatalf("second bind (would hang on a leaked lock): %v", err)
+	}
+	if s2 != s1 {
+		t.Fatalf("expected the same bound session to be reused")
+	}
+	p.ReleaseBind(key, s2, true)
+}
+
+// Regression: a server-side "session not found" (the harness reaping an idle
+// session) must recycle the session without burning its fingerprint for 24h.
+// Treating it as quota poisons the pool with cooling fingerprints over
+// ordinary lifecycle events — observed as spurious 502s after the container
+// had been idle ~20 minutes.
+func TestMarkGoneDoesNotExhaustFingerprint(t *testing.T) {
+	s := &Session{SessionID: "s1", ConversationID: "c1", CreatedAt: time.Now()}
+	s.MarkGone()
+	if s.quotaExceeded {
+		t.Fatal("MarkGone must not flag quotaExceeded")
+	}
+	if s.ReqCount < 1000 {
+		t.Fatalf("MarkGone must force recycling, ReqCount=%d", s.ReqCount)
+	}
+}
+
+func TestMarkQuotaExceededFlagsFingerprintBurn(t *testing.T) {
+	s := &Session{SessionID: "s1", ConversationID: "c1", CreatedAt: time.Now()}
+	s.MarkQuotaExceeded()
+	if !s.quotaExceeded {
+		t.Fatal("MarkQuotaExceeded must flag quotaExceeded")
+	}
+}

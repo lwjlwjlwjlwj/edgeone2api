@@ -54,6 +54,22 @@ func (s *Session) Lock() {
 	s.LastUsed = time.Now()
 }
 
+// tryLock acquires the session for exclusive use without blocking, marking it
+// active so the matching Unlock/Release can clear the flag.  Every checkout
+// path (Acquire/Bind) must go through here: Unlock() gates on the active
+// atomic, so acquiring with a bare s.mu.TryLock() would leave the flag false
+// and the mutex permanently leaked on release.  Maintenance probes that only
+// peek at availability keep using s.mu.TryLock() directly and pair it with a
+// raw s.mu.Unlock().
+func (s *Session) tryLock() bool {
+	if !s.mu.TryLock() {
+		return false
+	}
+	s.active.Store(true)
+	s.LastUsed = time.Now()
+	return true
+}
+
 // Unlock unlocks the session.  Idempotent: calling Unlock on an already
 // unlocked session is a no-op.  This guards against double-release when a
 // request's release closure is invoked more than once (e.g. an internal
@@ -76,6 +92,19 @@ func (s *Session) Unlock() {
 func (s *Session) MarkQuotaExceeded() {
 	s.ReqCount = 999999
 	s.quotaExceeded = true
+}
+
+// MarkGone flags the session for immediate recycling on the next
+// Release/ReleaseBind call *without* exhausting its browser fingerprint.
+//
+// Used when the upstream reports the session no longer exists.  The harness
+// reaps idle sessions server-side well before our own FreeTTL window, so a
+// plain "session not found" is normal lifecycle, not a quota event: burning
+// the fingerprint for 24h over it would slowly poison the pool with cooling
+// entries for sessions that never hit any limit.
+func (s *Session) MarkGone() {
+	s.ReqCount = 999999
+	s.quotaExceeded = false
 }
 
 // PoolConfig configures the session pool
@@ -316,7 +345,7 @@ func (p *Pool) Acquire(ctx context.Context) (*Session, error) {
 			if p.freeStale(now, s) {
 				continue // expired
 			}
-			if s.mu.TryLock() {
+			if s.tryLock() {
 				p.mu.Unlock()
 				return s, nil
 			}
@@ -360,7 +389,7 @@ func (p *Pool) Bind(ctx context.Context, key string) (*Session, error) {
 
 		if be, ok := p.binds[key]; ok {
 			s := be.session
-			if s.mu.TryLock() {
+			if s.tryLock() {
 				be.lastUsed = time.Now()
 				p.mu.Unlock()
 				return s, nil
@@ -381,7 +410,7 @@ func (p *Pool) Bind(ctx context.Context, key string) (*Session, error) {
 			if p.freeStale(now, s) {
 				continue
 			}
-			if s.mu.TryLock() {
+			if s.tryLock() {
 				p.free = append(p.free[:i], p.free[i+1:]...)
 				s.bound = true
 				p.binds[key] = &boundEntry{session: s, lastUsed: time.Now()}

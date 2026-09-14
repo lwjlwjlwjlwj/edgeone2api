@@ -246,21 +246,31 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var session *auth.Session
-	var release func(bool)
+	var release func(*auth.Session, bool)
+	// reacquire grabs a replacement session for the same affinity: a bound key
+	// rebinds, an anonymous request takes any free session.  Used whenever the
+	// current session turns out to be dead (upstream reaps idle sessions well
+	// before our own FreeTTL) so the request rotates transparently.
+	reacquire := func(ctx context.Context) (*auth.Session, error) {
+		if bound {
+			return s.pool.Bind(ctx, sessionKey)
+		}
+		return s.pool.Acquire(ctx)
+	}
 	if bound {
 		session, err = s.pool.Bind(ctx, sessionKey)
 		if err != nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": map[string]any{"message": "no available session: " + err.Error(), "type": "server_error"}})
 			return
 		}
-		release = func(success bool) { s.pool.ReleaseBind(sessionKey, session, success) }
+		release = func(sess *auth.Session, success bool) { s.pool.ReleaseBind(sessionKey, sess, success) }
 	} else {
 		session, err = s.pool.Acquire(ctx)
 		if err != nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": map[string]any{"message": "no available session: " + err.Error(), "type": "server_error"}})
 			return
 		}
-		release = func(success bool) { s.pool.Release(session, success) }
+		release = func(sess *auth.Session, success bool) { s.pool.Release(sess, success) }
 	}
 
 	// Resolve model mapping and apply selectModel if needed.
@@ -280,7 +290,23 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	selKey := mm.Provider + "/" + mm.Model + "/" + re
 	if session.SelectedModel != selKey {
-		if err := session.Client.SelectModel(ctx, session.SessionID, session.ConversationID, mm.Provider, mm.Model, re); err != nil {
+		err := session.Client.SelectModel(ctx, session.SessionID, session.ConversationID, mm.Provider, mm.Model, re)
+		if err != nil && upstream.IsSessionNotFound(err) {
+			// The harness reaps idle sessions server-side well before our own
+			// FreeTTL window, so this is normal lifecycle — not a quota event.
+			// Rebind a fresh session and select the model once more instead of
+			// proceeding with a dead session (the direct source of the 502).
+			log.Printf("[SELECTMODEL] %s: session gone, reacquiring: %v", selKey, err)
+			session.MarkGone()
+			release(session, false)
+			session, err = reacquire(ctx)
+			if err != nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": map[string]any{"message": "no available session: " + err.Error(), "type": "server_error"}})
+				return
+			}
+			err = session.Client.SelectModel(ctx, session.SessionID, session.ConversationID, mm.Provider, mm.Model, re)
+		}
+		if err != nil {
 			log.Printf("[SELECTMODEL] %s: %v", selKey, err)
 		} else {
 			session.SelectedModel = selKey
@@ -309,26 +335,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Stream {
-		s.streamChat(w, ctx, session, chatID, model, created, req.Messages, sessionKey, release, func(ctx context.Context) (*auth.Session, error) {
-			if bound {
-				return s.pool.Bind(ctx, sessionKey)
-			}
-			return s.pool.Acquire(ctx)
-		}, toolsJSON, textOnly)
+		s.streamChat(w, ctx, session, chatID, model, created, req.Messages, sessionKey, release, reacquire, toolsJSON, textOnly)
 	} else {
-		s.nonStreamChat(w, ctx, session, chatID, model, created, req.Messages, sessionKey, release, func(ctx context.Context) (*auth.Session, error) {
-			if bound {
-				return s.pool.Bind(ctx, sessionKey)
-			}
-			return s.pool.Acquire(ctx)
-		}, toolsJSON, textOnly)
+		s.nonStreamChat(w, ctx, session, chatID, model, created, req.Messages, sessionKey, release, reacquire, toolsJSON, textOnly)
 	}
 }
 
-func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, msgs []openaiMessage, sessionKey string, release func(bool), reacquire func(context.Context) (*auth.Session, error), toolsJSON string, textOnly bool) {
+func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, msgs []openaiMessage, sessionKey string, release func(*auth.Session, bool), reacquire func(context.Context) (*auth.Session, error), toolsJSON string, textOnly bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		release(false)
+		release(session, false)
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "streaming unsupported"})
 		return
 	}
@@ -343,8 +359,15 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 			if upstream.IsQuotaError(err) || upstream.IsSessionNotFound(err) {
 				// Quota / session-destroyed: rope the session and retry once with a
 				// fresh one (transparent rotation instead of failed response).
-				session.MarkQuotaExceeded()
-				release(false)
+				// A vanished session is upstream lifecycle, not a quota event: mark
+				// it gone so it is recycled *without* burning the browser
+				// fingerprint for 24h.
+				if upstream.IsQuotaError(err) {
+					session.MarkQuotaExceeded()
+				} else {
+					session.MarkGone()
+				}
+				release(session, false)
 				session, err = reacquire(ctx)
 				if err != nil {
 					writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": map[string]any{"message": "no available session: " + err.Error(), "type": "server_error"}})
@@ -352,7 +375,7 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 				}
 				continue // retry
 			}
-			release(false)
+			release(session, false)
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": "upstream error: " + err.Error(), "type": "upstream_error"}})
 			return
 		}
@@ -373,7 +396,7 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 		success := false
 
 		defer func() {
-			release(success)
+			release(session, success)
 		}()
 
 		var sb strings.Builder
@@ -466,11 +489,11 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 		return
 	}
 	// Both attempts failed
-	release(false)
+	release(session, false)
 	writeJSON(w, http.StatusBadGateway, map[string]any{"error": "upstream quota exceeded, retry later"})
 }
 
-func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, msgs []openaiMessage, sessionKey string, release func(bool), reacquire func(context.Context) (*auth.Session, error), toolsJSON string, textOnly bool) {
+func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, msgs []openaiMessage, sessionKey string, release func(*auth.Session, bool), reacquire func(context.Context) (*auth.Session, error), toolsJSON string, textOnly bool) {
 	var result upstream.ChatResult
 	var err error
 
@@ -482,8 +505,12 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 		cs, err = session.Client.StartChat(ctx, session.SessionID, session.ConversationID, items)
 		if err != nil {
 			if upstream.IsQuotaError(err) || upstream.IsSessionNotFound(err) {
-				session.MarkQuotaExceeded()
-				release(false)
+				if upstream.IsQuotaError(err) {
+					session.MarkQuotaExceeded()
+				} else {
+					session.MarkGone()
+				}
+				release(session, false)
 				session, err = reacquire(ctx)
 				if err != nil {
 					writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": map[string]any{"message": "no available session: " + err.Error(), "type": "server_error"}})
@@ -491,7 +518,7 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 				}
 				continue
 			}
-			release(false)
+			release(session, false)
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": "upstream error: " + err.Error(), "type": "upstream_error"}})
 			return
 		}
@@ -508,7 +535,7 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 		break
 	}
 	if err != nil {
-		release(false)
+		release(session, false)
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": "upstream error: " + err.Error(), "type": "upstream_error"}})
 		return
 	}
@@ -560,7 +587,7 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 		},
 	}
 
-	release(success)
+	release(session, success)
 	w.Header().Set("X-Session-Key", sessionKey)
 	writeJSON(w, http.StatusOK, resp)
 }
