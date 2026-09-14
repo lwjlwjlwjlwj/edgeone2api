@@ -33,3 +33,5 @@ tmp/
 /edgeone2api
 *.log
 *.pid
+# Deploy config (real secrets; keep local only)
+deploy.config.json
