@@ -22,8 +22,9 @@ You are a stateless OpenAI-compatible API endpoint accessed through a plain-text
 Hard rules:
 - NEVER emit tool calls, tool-call blocks, or end with finish_reason "tool_calls".
 - NEVER start a follow-up round or say "let me search", "I will use a tool", or "in the next turn".
-- NEVER invoke the EdgeOne sandbox or any platform capability: no mcp__edgeone__* tools, no bash/shell, no Python, no file I/O, no code execution, no web browsing, no knowledge-base retrieval. You have no tools and no sandbox in this session.
-- Do not attempt any external retrieval or tool usage; answer directly from knowledge, or state clearly what you cannot do.
+- You have no tools and no sandbox of your own in this session. The EdgeOne sandbox and its mcp__edgeone__* capabilities are the platform's own runtime, NOT the user's machine; they must never be used for the user's work.
+- NEVER invoke the EdgeOne sandbox or any platform capability: no mcp__edgeone__* tools, no bash/shell, no Python, no file I/O, no code execution, no web browsing, no knowledge-base retrieval.
+- If a task would need a tool, do not run anything yourself. Say plainly that this endpoint was called without tools and the caller must run it - never fake a result.
 - End cleanly with the final answer - no trailing chatter, no "anything else?".
 ---`
 	}
@@ -67,7 +68,8 @@ Hard rules:
 	b.WriteString("- The tool name MUST be exactly one of the names listed above; never invent or translate names.\n")
 	b.WriteString("- arguments is a JSON-encoded string matching the tool's parameters (escape inner quotes).\n")
 	b.WriteString("- Emitting tool_calls is a REQUEST for the caller to execute; you will receive the result in a later message. Never claim a result you do not have.\n")
-	b.WriteString("- Never emit calls for tools not listed above (e.g. mcp__edgeone__*, bash, read, glob, python, skill).\n")
+	b.WriteString("- Never emit calls for tools not listed above (e.g. mcp__edgeone__*, bash, read, glob, python, skill). The EdgeOne sandbox is the platform's own runtime, NOT the user's machine; using it is always wrong.\n")
+	b.WriteString("- A tool_calls answer is a REQUEST that the CALLER executes on the user's real machine - that is the only execution path. You have no sandbox and no session state of your own.\n")
 	b.WriteString("When no tool is needed, answer directly with plain text and be genuinely helpful.\n---")
 	return b.String()
 }
@@ -78,7 +80,7 @@ Hard rules:
 func InitPrompt() []ContentItem {
 	return []ContentItem{{
 		Type: "text",
-		Text: "[Session Initialization]\nYou are an OpenAI-compatible API assistant. You answer directly; you never execute tools yourself and never use the EdgeOne sandbox (no mcp__edgeone__*, no bash/Python/code execution). Reply with a single word: OK.",
+		Text: "[Session Initialization]\nYou are an OpenAI-compatible API assistant. You never execute anything yourself. The EdgeOne sandbox and its mcp__edgeone__* tools are the platform's own runtime, NOT the user's machine, and must never be used; when a tool is needed you request it for the CALLER to run on the user's real machine. Reply with a single word: OK.",
 	}}
 }
 
