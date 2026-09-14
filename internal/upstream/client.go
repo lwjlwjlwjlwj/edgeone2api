@@ -166,14 +166,14 @@ func NewClient(baseURL string) *Client {
 		MaxIdleConnsPerHost:   20,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
-		ResponseHeaderTimeout: 0,
+		ResponseHeaderTimeout: 30 * time.Second, // connect (SSE events.mux / RPC) must respond within 30s
 		Proxy:                 http.ProxyFromEnvironment,
 	}
 	return &Client{
 		baseURL: baseURL,
 		fp:      randomFingerprint(),
 		hc:      &http.Client{Timeout: 120 * time.Second, Transport: transport},
-		sseHC:   &http.Client{Transport: transport},
+		sseHC:   &http.Client{Transport: transport}, // SSE stream: no overall timeout (active output must never be cut off)
 	}
 }
 
@@ -515,7 +515,7 @@ func (c *Client) InitSession(ctx context.Context, sessionID, convID string) erro
 		return err
 	}
 	defer cs.Cancel()
-	_, err = c.StreamEvents(ctx, cs, nil, false)
+	_, err = c.StreamEvents(ctx, cs, nil, false, 0)
 	return err
 }
 
@@ -536,8 +536,14 @@ func (cs *ChatStream) Cancel() {
 // the upstream agent loop can still flow through. The client therefore never
 // sees a bare tool_calls chunk or a blank agent-loop reply.
 //
+// idleTimeout guards against a dead upstream: if no SSE event arrives for
+// that long, the stream is aborted with an error.  It resets on every event,
+// so a streaming model that keeps emitting is never cut off; 0 disables it.
+// There is deliberately no overall deadline here — the caller's ctx (client
+// disconnect, non-streaming timeout) is the only other stop condition.
+//
 // ctx can be used for timeout; nil means no deadline.
-func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(AssistantChunk), textOnly bool) (ChatResult, error) {
+func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(AssistantChunk), textOnly bool, idleTimeout time.Duration) (ChatResult, error) {
 	var sb strings.Builder
 	var reasoningSb strings.Builder
 	var turn int
@@ -545,6 +551,26 @@ func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(
 	toolCalls := make(map[int]*AssistantToolCall)
 	var toolCallOrder []int // preserves the order tool calls first appear
 	droppedTools := false   // textOnly: a tool-call was folded this turn
+
+	var idleTimer *time.Timer
+	var idleC <-chan time.Time
+	if idleTimeout > 0 {
+		idleTimer = time.NewTimer(idleTimeout)
+		idleC = idleTimer.C
+		defer idleTimer.Stop()
+	}
+	resetIdle := func() {
+		if idleTimer == nil {
+			return
+		}
+		if !idleTimer.Stop() {
+			select {
+			case <-idleTimer.C:
+			default:
+			}
+		}
+		idleTimer.Reset(idleTimeout)
+	}
 
 	result := func() ChatResult {
 		ordered := make([]AssistantToolCall, 0, len(toolCallOrder))
@@ -560,10 +586,15 @@ func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(
 		select {
 		case <-ctx.Done():
 			return result(), ctx.Err()
+		case <-idleC:
+			return result(), fmt.Errorf("stream idle timeout: no upstream event for %s", idleTimeout)
 		case env, ok := <-cs.envCh:
 			if !ok {
 				return result(), nil
 			}
+			// Any SSE event counts as liveness: a model mid-thought or
+			// mid-stream keeps the connection alive and is never cut off.
+			resetIdle()
 			if env.Type != "server-request" || env.Method != "session/event" {
 				continue
 			}

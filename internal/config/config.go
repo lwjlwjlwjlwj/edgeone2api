@@ -18,8 +18,11 @@ type Config struct {
 	MaxReqPerSession int                     `json:"max_req_per_session"`
 	UpstreamURL      string                  `json:"upstream_url"`
 	AgentPreset      string                  `json:"agent_preset"`
-	RequestJitterMs  int                     `json:"request_jitter_ms"` // pseudo-concurrency: random delay [0,N)ms before sending to upstream
-	MaxConcurrent    int                     `json:"max_concurrent"`     // cap of in-flight upstream requests (0 = unlimited)
+	RequestJitterMs  int                     `json:"request_jitter_ms"`  // pseudo-concurrency: random delay [0,N)ms before sending to upstream
+	MaxConcurrent    int                     `json:"max_concurrent"`      // cap of in-flight upstream requests (0 = unlimited)
+	RequestTimeout   int                     `json:"request_timeout_seconds"` // non-streaming overall timeout (streaming has no total deadline)
+	StreamIdle       int                     `json:"stream_idle_seconds"`     // streaming: break when no upstream event for N seconds (0 = disabled)
+	DefaultReasoningEffort string            `json:"default_reasoning_effort"` // global fallback reasoning strength ("off"/"high"/"max"/"") when client & model_map don't specify
 	ModelMap         map[string]ModelMapping `json:"model_map"`
 }
 
@@ -61,6 +64,9 @@ func defaultConfig() Config {
 		AgentPreset:      "minimal",
 		RequestJitterMs:  0,
 		MaxConcurrent:    0,
+		RequestTimeout:   600, // non-streaming: 10min overall budget
+		StreamIdle:       180, // streaming: 3min without any upstream event = dead
+		DefaultReasoningEffort: "off", // default: no reasoning, so the full 16k completion budget goes to content
 		ModelMap:         defaultModelMap(),
 	}
 }
@@ -123,6 +129,19 @@ func Load(path string) (Config, error) {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.MaxConcurrent = n
 		}
+	}
+	if v := os.Getenv("EDGEONE_API_REQUEST_TIMEOUT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.RequestTimeout = n
+		}
+	}
+	if v := os.Getenv("EDGEONE_API_STREAM_IDLE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.StreamIdle = n
+		}
+	}
+	if v := os.Getenv("EDGEONE_API_DEFAULT_REASONING_EFFORT"); v != "" {
+		cfg.DefaultReasoningEffort = v
 	}
 	return cfg, nil
 }

@@ -40,7 +40,7 @@ func main() {
 	time.Sleep(2 * time.Second)
 	log.Printf("session pool ready: %d session(s)", pool.Count())
 
-	srv := server.New(pool, cfg.APIKey, cfg.Models, 180*time.Second, cfg.ModelMap, cfg.RequestJitterMs, cfg.MaxConcurrent)
+	srv := server.New(pool, cfg.APIKey, cfg.Models, time.Duration(cfg.RequestTimeout)*time.Second, time.Duration(cfg.StreamIdle)*time.Second, cfg.ModelMap, cfg.DefaultReasoningEffort, cfg.RequestJitterMs, cfg.MaxConcurrent)
 	httpServer := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           srv.Handler(),

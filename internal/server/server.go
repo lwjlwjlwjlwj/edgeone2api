@@ -49,7 +49,9 @@ type Server struct {
 	pool     *auth.Pool
 	apiKey   string
 	models   []string
-	timeout  time.Duration
+	timeout  time.Duration // non-streaming overall timeout
+	streamIdle time.Duration // streaming: no event for this long = dead (0 = disabled)
+	defaultReasoningEffort string // fallback when client & model_map don't specify
 	modelMap map[string]config.ModelMapping
 	jitterMs int // pseudo-concurrency: random pre-send delay [0, jitterMs)
 	rng      *mathrand.Rand
@@ -58,7 +60,7 @@ type Server struct {
 }
 
 // New creates a new server
-func New(pool *auth.Pool, apiKey string, models []string, timeout time.Duration, modelMap map[string]config.ModelMapping, jitterMs, maxConcurrent int) *Server {
+func New(pool *auth.Pool, apiKey string, models []string, timeout, streamIdle time.Duration, modelMap map[string]config.ModelMapping, defaultReasoningEffort string, jitterMs, maxConcurrent int) *Server {
 	if len(models) == 0 {
 		models = []string{"@makers/deepseek-v4-flash", "@makers/deepseek-v4-pro"}
 	}
@@ -66,13 +68,15 @@ func New(pool *auth.Pool, apiKey string, models []string, timeout time.Duration,
 		modelMap = map[string]config.ModelMapping{}
 	}
 	s := &Server{
-		pool:     pool,
-		apiKey:   apiKey,
-		models:   models,
-		timeout:  timeout,
-		modelMap: modelMap,
-		jitterMs: jitterMs,
-		rng:      mathrand.New(mathrand.NewSource(time.Now().UnixNano())),
+		pool:       pool,
+		apiKey:     apiKey,
+		models:     models,
+		timeout:    timeout,
+		streamIdle: streamIdle,
+		defaultReasoningEffort: defaultReasoningEffort,
+		modelMap:   modelMap,
+		jitterMs:   jitterMs,
+		rng:        mathrand.New(mathrand.NewSource(time.Now().UnixNano())),
 	}
 	if maxConcurrent > 0 {
 		s.sem = make(chan struct{}, maxConcurrent)
@@ -226,8 +230,20 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	sessionKey := r.Header.Get("X-Session-Key")
 	bound := sessionKey != ""
 
-	ctx, cancel := context.WithTimeout(r.Context(), s.timeout)
-	defer cancel()
+	// Timeout semantics differ by mode:
+	//   - Non-streaming: overall budget (s.timeout) covers the whole round-trip.
+	//   - Streaming: NO overall deadline — an active upstream that keeps
+	//     emitting events must never be cut off mid-stream.  The client's own
+	//     disconnect cancels r.Context() naturally; a dead upstream is caught
+	//     by the per-event idle timeout inside StreamEvents.  The same ctx is
+	//     handed to StartChat, whose internal SSE/RPC setup has its own guards
+	//     (RPC client timeout + SSE response-header timeout).
+	ctx := r.Context()
+	if !req.Stream && s.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(r.Context(), s.timeout)
+		defer cancel()
+	}
 
 	var session *auth.Session
 	var release func(bool)
@@ -253,9 +269,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		// Fallback: treat the model string as-is with edgeone-makers provider
 		mm = config.ModelMapping{Provider: "edgeone-makers", Model: model}
 	}
+	// Reasoning effort precedence: client request > model_map mapping >
+	// global default_reasoning_effort (config) > unset (upstream default).
 	re := normalizeReasoningEffort(req.ReasoningEffort)
 	if re == "" {
 		re = normalizeReasoningEffort(mm.ReasoningEffort)
+	}
+	if re == "" {
+		re = normalizeReasoningEffort(s.defaultReasoningEffort)
 	}
 	selKey := mm.Provider + "/" + mm.Model + "/" + re
 	if session.SelectedModel != selKey {
@@ -411,7 +432,7 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 				emitSSE(w, chatID, model, created, delta)
 				flusher.Flush()
 			}
-		}, textOnly)
+		}, textOnly, s.streamIdle)
 		logTools(sessionKey, result.ToolCalls)
 		finishReason := result.FinishReason
 		if finishReason == "" {
@@ -479,7 +500,7 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 		// a cancelled stream cuts it off.  Tools execute on the client, never
 		// in the sandbox.
 		defer cs.Cancel()
-		result, err = session.Client.StreamEvents(ctx, cs, nil, textOnly)
+		result, err = session.Client.StreamEvents(ctx, cs, nil, textOnly, 0)
 		logTools(sessionKey, result.ToolCalls)
 		if err != nil {
 			log.Printf("[CHAT] stream error: %v", err)

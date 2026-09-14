@@ -38,7 +38,7 @@ func runEvents(t *testing.T, chunks []SSEEnvelope, textOnly bool) ChatResult {
 	close(envCh)
 	c := &Client{}
 	cs := &ChatStream{envCh: envCh}
-	res, err := c.StreamEvents(context.Background(), cs, nil, textOnly)
+	res, err := c.StreamEvents(context.Background(), cs, nil, textOnly, 0)
 	if err != nil {
 		t.Fatalf("StreamEvents: %v", err)
 	}

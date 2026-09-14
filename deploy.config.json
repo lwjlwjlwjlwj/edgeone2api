@@ -26,13 +26,11 @@
     },
     "@makers/deepseek-v4-pro": {
       "provider": "edgeone-makers",
-      "model": "@makers/deepseek-v4-pro",
-      "reasoning_effort": "high"
+      "model": "@makers/deepseek-v4-pro"
     },
     "@makers/deepseek-v4-flash": {
       "provider": "edgeone-makers",
-      "model": "@makers/deepseek-v4-flash",
-      "reasoning_effort": "high"
+      "model": "@makers/deepseek-v4-flash"
     },
     "@makers/minimax-m3": {
       "provider": "edgeone-makers",
@@ -48,5 +46,8 @@
     }
   },
   "request_jitter_ms": 1500,
-  "max_concurrent": 4
+  "max_concurrent": 4,
+  "request_timeout_seconds": 600,
+  "stream_idle_seconds": 180,
+  "default_reasoning_effort": "off"
 }
