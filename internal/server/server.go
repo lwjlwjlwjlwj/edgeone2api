@@ -328,6 +328,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	//     Tool results come back as follow-up role=tool messages.
 	toolsJSON := ""
 	textOnly := len(req.Tools) == 0
+	filter := newToolFilter(req.Tools)
 	if len(req.Tools) > 0 {
 		if b, err := json.Marshal(req.Tools); err == nil {
 			toolsJSON = string(b)
@@ -335,13 +336,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Stream {
-		s.streamChat(w, ctx, session, chatID, model, created, req.Messages, sessionKey, release, reacquire, toolsJSON, textOnly)
+		s.streamChat(w, ctx, session, chatID, model, created, req.Messages, sessionKey, release, reacquire, toolsJSON, textOnly, filter)
 	} else {
-		s.nonStreamChat(w, ctx, session, chatID, model, created, req.Messages, sessionKey, release, reacquire, toolsJSON, textOnly)
+		s.nonStreamChat(w, ctx, session, chatID, model, created, req.Messages, sessionKey, release, reacquire, toolsJSON, textOnly, filter)
 	}
 }
 
-func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, msgs []openaiMessage, sessionKey string, release func(*auth.Session, bool), reacquire func(context.Context) (*auth.Session, error), toolsJSON string, textOnly bool) {
+func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, msgs []openaiMessage, sessionKey string, release func(*auth.Session, bool), reacquire func(context.Context) (*auth.Session, error), toolsJSON string, textOnly bool, filter *toolFilter) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		release(session, false)
@@ -402,7 +403,8 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 		var sb strings.Builder
 		var result upstream.ChatResult
 		var streamErr error
-		toolSeen := make(map[int]bool) // tool-call index -> first (name/id) delta already sent
+		toolSeen := make(map[int]bool)     // tool-call index -> first (name/id) delta already sent
+		toolDropped := make(map[int]bool) // tool-call index -> suppressed by name filter
 
 		// Cancel the SSE stream as soon as this turn ends.  The upstream agent
 		// loop (EdgeOne sandbox tool execution) only starts after turn/end; a
@@ -426,8 +428,19 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 			}
 			if chunk.ToolCall != nil && !textOnly {
 				tc := chunk.ToolCall
+				if toolDropped[tc.Index] {
+					return // this call's name failed the declared-tool filter; suppress all its deltas
+				}
 				if tc.Name != "" && !toolSeen[tc.Index] {
 					// First delta for this tool call: id/type/name + any argument text.
+					// Validate the name against the client's declared set (alias
+					// table included); unlisted names are dropped and logged instead
+					// of leaking "Tool not found" errors to the client.
+					name := filter.filterStreamCall(tc.Name)
+					if name == "" {
+						toolDropped[tc.Index] = true
+						return
+					}
 					toolSeen[tc.Index] = true
 					delta["role"] = "assistant"
 					delta["content"] = nil
@@ -435,7 +448,7 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 						"index":    tc.Index,
 						"id":       tc.ID,
 						"type":     "function",
-						"function": map[string]any{"name": tc.Name, "arguments": tc.ArgumentsDelta},
+						"function": map[string]any{"name": name, "arguments": tc.ArgumentsDelta},
 					}}
 				} else if tc.ArgumentsDelta != "" {
 					// Streaming argument fragment for an already-announced call.
@@ -466,9 +479,10 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 		// tool-call blocks), the JSON already streamed out as content.  Emit
 		// the parsed tool_calls as a final delta so OpenAI clients see a
 		// structured tool_calls turn and finish_reason=tool_calls, matching
-		// the non-streaming aggregation.
+		// the non-streaming aggregation.  Names are filtered against the
+		// client's declared set like the native path.
 		if !textOnly && finishReason != "tool_calls" {
-			if calls := parseToolCalls(sb.String()); calls != nil {
+			if calls := filter.filterCalls(parseToolCalls(sb.String())); len(calls) > 0 {
 				emitToolCallsSSE(w, chatID, model, created, calls)
 				flusher.Flush()
 				finishReason = "tool_calls"
@@ -493,7 +507,7 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 	writeJSON(w, http.StatusBadGateway, map[string]any{"error": "upstream quota exceeded, retry later"})
 }
 
-func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, msgs []openaiMessage, sessionKey string, release func(*auth.Session, bool), reacquire func(context.Context) (*auth.Session, error), toolsJSON string, textOnly bool) {
+func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, msgs []openaiMessage, sessionKey string, release func(*auth.Session, bool), reacquire func(context.Context) (*auth.Session, error), toolsJSON string, textOnly bool, filter *toolFilter) {
 	var result upstream.ChatResult
 	var err error
 
@@ -554,14 +568,16 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 		// workbuddy2api-style tool aggregation: prefer upstream-native
 		// tool-call events (real tool-call blocks), falling back to the
 		// ToolForge JSON-text protocol (the model declares a tool_calls JSON
-		// as plain text).  Names pass through untouched — no translation.
+		// as plain text).  Names are validated against the client's declared
+		// tool set (with a small alias table); unlisted names are dropped and
+		// logged instead of leaking "Tool not found" errors to the client.
 		// The calls are returned to the client for execution; the EdgeOne
 		// sandbox never runs them.
-		if calls := toOpenAIToolCalls(result.ToolCalls); len(calls) > 0 {
+		if calls := filter.filterCalls(toOpenAIToolCalls(result.ToolCalls)); len(calls) > 0 {
 			msg["content"] = nil
 			msg["tool_calls"] = calls
 			finish = "tool_calls"
-		} else if calls := parseToolCalls(result.Text); calls != nil {
+		} else if calls := filter.filterCalls(parseToolCalls(result.Text)); len(calls) > 0 {
 			msg["content"] = nil
 			msg["tool_calls"] = calls
 			finish = "tool_calls"
