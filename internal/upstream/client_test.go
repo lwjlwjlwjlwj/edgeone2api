@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 func env(eventType string, data map[string]any) SSEEnvelope {
@@ -130,5 +131,102 @@ func TestBuildDirectiveUnparseableToolsFallsBack(t *testing.T) {
 	d := BuildDirective("not-json")
 	if !strings.Contains(d, "NEVER emit tool calls") {
 		t.Fatalf("unparseable tools must fall back to the plain directive:\n%s", d)
+	}
+}
+
+// The observed transient stall is "net/http: timeout awaiting response
+// headers" — note it contains "timeout" but NOT "timed out", so it must not be
+// classified as quota (which would burn a fingerprint for 24h).
+func TestIsTransientErrorClassifiesHarnessStalls(t *testing.T) {
+	transient := []string{
+		`Post "https://x/api/session.selectModel": net/http: timeout awaiting response headers`,
+		"context deadline exceeded",
+		"dial tcp: i/o timeout",
+		"read tcp: connection reset by peer",
+		"unexpected EOF",
+	}
+	for _, m := range transient {
+		if !IsTransientError(errorsNew(m)) {
+			t.Errorf("expected transient: %q", m)
+		}
+	}
+	permanent := []string{
+		"session.prompt: status 400",
+		"session.selectModel failed: invalid model",
+		"authentication failed",
+	}
+	for _, m := range permanent {
+		if IsTransientError(errorsNew(m)) {
+			t.Errorf("did not expect transient: %q", m)
+		}
+	}
+	if IsTransientError(nil) {
+		t.Error("nil must not be transient")
+	}
+}
+
+// A transient stall must never be mistaken for quota exhaustion (the two
+// classifiers must be disjoint on that input), otherwise a single network blip
+// would exhaust a browser fingerprint for 24h.
+func TestTransientStallIsNotQuota(t *testing.T) {
+	err := errorsNew(`Post "https://x/api/session.create": net/http: timeout awaiting response headers`)
+	if !IsTransientError(err) {
+		t.Fatal("stall must be transient")
+	}
+	if IsQuotaError(err) {
+		t.Fatal("stall must NOT be classified as quota")
+	}
+}
+
+type errString string
+
+func (e errString) Error() string { return string(e) }
+
+func errorsNew(s string) error { return errString(s) }
+
+func TestIsTransientErrorIncludesStreamIdle(t *testing.T) {
+	// The stream-idle guard produces this exact string; it must be retryable.
+	err := errorsNew("stream idle timeout: no upstream event for 3m0s")
+	if !IsTransientError(err) {
+		t.Fatal("stream idle timeout must be transient")
+	}
+}
+
+// A non-converging agent loop (endless chain of tool-call turns) must be cut
+// off after a bounded number of folded turns instead of hanging the request.
+func TestStreamEventsBoundsNonConvergingToolLoop(t *testing.T) {
+	var chunks []SSEEnvelope
+	for i := 1; i <= 40; i++ {
+		chunks = append(chunks,
+			env("turn/start", map[string]any{"turn": i}),
+			chunkEnv(i, map[string]any{"type": "text-delta", "text": "x"}),
+			chunkEnv(i, map[string]any{"type": "block-start", "blockType": "tool-call"}),
+			env("turn/end", map[string]any{"turn": i}),
+		)
+	}
+
+	// Feed on a goroutine so the bounded fold returns without the producer
+	// blocking on a full (deadlocking) channel.
+	envCh := make(chan SSEEnvelope)
+	go func() {
+		defer close(envCh)
+		for _, e := range chunks {
+			envCh <- e
+		}
+	}()
+	c := &Client{}
+	cs := &ChatStream{envCh: envCh}
+	done := make(chan ChatResult, 1)
+	go func() {
+		res, _ := c.StreamEvents(context.Background(), cs, nil, 0)
+		done <- res
+	}()
+	select {
+	case res := <-done:
+		if res.FinishReason != "stop" {
+			t.Fatalf("finish reason must be stop, got %q", res.FinishReason)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("non-converging loop must be bounded, but StreamEvents hung")
 	}
 }

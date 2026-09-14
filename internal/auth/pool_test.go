@@ -315,3 +315,52 @@ func TestAcquireScalesUnderBurst(t *testing.T) {
 		t.Fatalf("expected %d free sessions after release, got %d", burst, got)
 	}
 }
+
+// Regression: Acquire/Bind acquire sessions with a non-blocking lock and must
+// mark the session active so the matching Release/ReleaseBind clears it.  A
+// bare s.mu.TryLock() leaves the active flag false, and Unlock()'s CAS gate
+// then returns early — leaking the mutex forever.  A second request on the
+// same key/session would block in Bind indefinitely (observed as F_turn2
+// hanging ~200s with no "open event stream" log line).
+func TestReleaseDoesNotLeakSessionLock(t *testing.T) {
+	p := testPool()
+	p.mu.Lock()
+	p.free = append(p.free, &Session{SessionID: "s1", ConversationID: "c1"})
+	p.mu.Unlock()
+
+	s, err := p.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	p.Release(s, true)
+	if !s.mu.TryLock() {
+		t.Fatal("session mutex still held after Release (checkout did not set active)")
+	}
+	s.mu.Unlock()
+}
+
+func TestReleaseBindDoesNotLeakSessionLock(t *testing.T) {
+	p := testPool()
+	p.mu.Lock()
+	p.free = append(p.free, &Session{SessionID: "s1", ConversationID: "c1"})
+	p.mu.Unlock()
+
+	s, err := p.Bind(context.Background(), "k")
+	if err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	p.ReleaseBind("k", s, true)
+	if !s.mu.TryLock() {
+		t.Fatal("session mutex still held after ReleaseBind (checkout did not set active)")
+	}
+	s.mu.Unlock()
+
+	// And the same key must be re-bindable (the real-world failure mode).
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	s2, err := p.Bind(ctx, "k")
+	if err != nil {
+		t.Fatalf("re-bind on same key must succeed, got: %v", err)
+	}
+	p.ReleaseBind("k", s2, true)
+}

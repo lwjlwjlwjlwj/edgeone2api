@@ -12,6 +12,7 @@ import (
 	"log"
 	"math/big"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -472,6 +473,7 @@ type ChatResult struct {
 type ChatStream struct {
 	envCh     <-chan SSEEnvelope
 	cancelSSE func()
+	tag       string // session id, for debug logging only
 }
 
 // StartChat opens the event stream and submits the prompt (steer mode).
@@ -480,22 +482,34 @@ type ChatStream struct {
 func (c *Client) StartChat(ctx context.Context, sessionID, convID string, items []ContentItem) (*ChatStream, error) {
 	streamCtx, cancelStream := context.WithCancel(ctx)
 
+	tOpen := time.Now()
 	envCh, cancelSSE, err := c.OpenEventStream(streamCtx, convID)
 	if err != nil {
 		cancelStream()
 		return nil, fmt.Errorf("open event stream: %w", err)
 	}
+	if debugEvents {
+		log.Printf("[CHAT] %s open event stream in %s", sessionID, time.Since(tOpen).Round(time.Millisecond))
+	}
 
 	// send prompt after the SSE stream is established
+	tPrompt := time.Now()
 	if err := c.SendPrompt(ctx, sessionID, convID, items); err != nil {
 		cancelSSE()
 		cancelStream()
+		if debugEvents {
+			log.Printf("[CHAT] %s send prompt failed after %s: %v", sessionID, time.Since(tPrompt).Round(time.Millisecond), err)
+		}
 		return nil, err
+	}
+	if debugEvents {
+		log.Printf("[CHAT] %s prompt accepted in %s", sessionID, time.Since(tPrompt).Round(time.Millisecond))
 	}
 
 	return &ChatStream{
 		envCh:     envCh,
 		cancelSSE: func() { cancelSSE(); cancelStream() },
+		tag:       sessionID,
 	}, nil
 }
 
@@ -540,6 +554,16 @@ func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(
 	var reasoningSb strings.Builder
 	var turn int
 	droppedTools := false // a tool-call block was folded this turn
+	foldedTurns := 0      // consecutive tool-driven turns folded away
+
+	// In the plain-text posture a tool-driven turn is folded and the stream is
+	// consumed further, so upstream follow-up text can still flow through.  But
+	// when the conversation already contains an assistant.tool_calls / role:tool
+	// history, the upstream agent loop can re-activate and spin indefinitely,
+	// emitting an endless chain of tool-call turns (every event resets the idle
+	// timer, so idleTimeout never fires).  Bound the folding so a non-converging
+	// loop is cut off instead of hanging the request until the overall timeout.
+	const maxFoldedTurns = 8
 
 	var idleTimer *time.Timer
 	var idleC <-chan time.Time
@@ -564,6 +588,9 @@ func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(
 	result := func() ChatResult {
 		return ChatResult{Text: sb.String(), Reasoning: reasoningSb.String(), FinishReason: "stop"}
 	}
+	if debugEvents {
+		log.Printf("[CHAT] %s stream armed idle=%s", cs.tag, idleTimeout)
+	}
 
 	for {
 		select {
@@ -584,6 +611,9 @@ func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(
 			se := SessionEvent{}
 			if err := json.Unmarshal(env.Payload, &se); err != nil {
 				continue
+			}
+			if debugEvents {
+				log.Printf("[STREAM] %s event type=%q turn=%d data=%s", cs.tag, se.Event.Type, turn, truncateString(string(se.Event.Data), 160))
 			}
 			switch se.Event.Type {
 			case "turn/start":
@@ -671,6 +701,13 @@ func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(
 				json.Unmarshal(se.Event.Data, &d)
 				if turn > 0 && d.Turn == turn {
 					if droppedTools {
+						foldedTurns++
+						if foldedTurns >= maxFoldedTurns {
+							// The upstream agent loop is not converging; return the text
+							// accumulated so far instead of hanging.
+							log.Printf("[STREAM] folding %d tool-driven turns without converge, cutting off", foldedTurns)
+							return result(), nil
+						}
 						continue // tool-driven turn: keep consuming follow-up turns
 					}
 					if onDelta != nil {
@@ -694,6 +731,11 @@ func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(
 
 // ensure io is referenced (reserved for future body streaming helpers)
 var _ io.Reader
+
+// debugEvents, when true (env EDGEONE_DEBUG_EVENTS=1), logs every upstream SSE
+// event type so a stalled turn can be diagnosed (e.g. a non-converging agent
+// loop that keeps the stream alive without producing text).
+var debugEvents = os.Getenv("EDGEONE_DEBUG_EVENTS") != ""
 
 // IsQuotaError checks if an error from the upstream indicates a quota/rate-limit
 // condition that should trigger session rotation.
@@ -719,4 +761,36 @@ func IsSessionNotFound(err error) bool {
 		return false
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "not found")
+}
+
+// IsTransientError reports whether err is a recoverable transport-level
+// failure — a timeout, dropped connection or EOF — rather than an
+// application-level rejection by the upstream.  The harness endpoints
+// intermittently stall (e.g. "timeout awaiting response headers" on
+// session.selectModel / session.prompt) with no relation to quota or session
+// state, so callers should retry once instead of surfacing a 502.
+//
+// Deliberately disjoint from IsQuotaError's patterns so a transient blip is
+// never mistaken for quota exhaustion (which would burn a fingerprint for 24h).
+func IsTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, pat := range []string{
+		"timeout awaiting response headers",
+		"context deadline exceeded",
+		"i/o timeout",
+		"connection reset",
+		"connection refused",
+		"broken pipe",
+		"unexpected eof",
+		"stream idle timeout",
+		"temporarily unavailable",
+	} {
+		if strings.Contains(msg, pat) {
+			return true
+		}
+	}
+	return false
 }

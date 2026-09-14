@@ -343,7 +343,8 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 		items := s.buildItems(session, sessionKey, msgs, toolsJSON)
 		cs, err := session.Client.StartChat(ctx, session.SessionID, session.ConversationID, items)
 		if err != nil {
-			if upstream.IsQuotaError(err) || upstream.IsSessionNotFound(err) {
+			quotaOrGone := upstream.IsQuotaError(err) || upstream.IsSessionNotFound(err)
+			if quotaOrGone && attempt == 0 {
 				// Quota / session-destroyed: rope the session and retry once with a
 				// fresh one (transparent rotation instead of failed response).
 				session.MarkQuotaExceeded()
@@ -354,6 +355,20 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 					return
 				}
 				continue // retry
+			}
+			if upstream.IsTransientError(err) && attempt == 0 {
+				// Upstream harness stall (e.g. "timeout awaiting response headers"):
+				// keep the session and retry once after a short backoff rather than
+				// surfacing a spurious 502.
+				log.Printf("[CHAT] transient upstream error, retrying: %v", err)
+				select {
+				case <-ctx.Done():
+					release(false)
+					writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": "upstream error: " + err.Error(), "type": "upstream_error"}})
+					return
+				case <-time.After(500 * time.Millisecond):
+				}
+				continue // retry, same session
 			}
 			release(false)
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": "upstream error: " + err.Error(), "type": "upstream_error"}})
@@ -509,7 +524,7 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 		items := s.buildItems(session, sessionKey, msgs, toolsJSON)
 		cs, err = session.Client.StartChat(ctx, session.SessionID, session.ConversationID, items)
 		if err != nil {
-			if upstream.IsQuotaError(err) || upstream.IsSessionNotFound(err) {
+			if attempt == 0 && (upstream.IsQuotaError(err) || upstream.IsSessionNotFound(err)) {
 				session.MarkQuotaExceeded()
 				release(false)
 				session, err = reacquire(ctx)
@@ -519,18 +534,32 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 				}
 				continue
 			}
+			if attempt == 0 && upstream.IsTransientError(err) {
+				// Upstream harness stall: retry once on the same session instead of
+				// surfacing a spurious 502 (see IsTransientError).
+				log.Printf("[CHAT] transient upstream error, retrying: %v", err)
+				select {
+				case <-ctx.Done():
+				case <-time.After(500 * time.Millisecond):
+				}
+				continue
+			}
 			release(false)
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": "upstream error: " + err.Error(), "type": "upstream_error"}})
 			return
 		}
-		// Cancel the SSE stream as soon as the turn ends: the upstream agent
-		// loop (EdgeOne sandbox execution) would only run after turn/end, and
-		// a cancelled stream cuts it off.  Tools execute on the client, never
-		// in the sandbox.
-		defer cs.Cancel()
-		result, err = session.Client.StreamEvents(ctx, cs, nil, 0)
+		// Cancel the SSE stream as soon as the turn ends.  The upstream agent
+		// loop (sandbox tool execution) only starts after turn/end; a cancelled
+		// stream cuts it off — the sandbox never runs.  Tools execute on the
+		// client, never in the sandbox.
+		cancelStream := cs.Cancel
+		result, err = session.Client.StreamEvents(ctx, cs, nil, s.streamIdle)
+		cancelStream()
 		if err != nil {
 			log.Printf("[CHAT] stream error: %v", err)
+			if attempt == 0 && upstream.IsTransientError(err) {
+				continue // retry once; the failed stream was just cancelled
+			}
 		}
 		break
 	}

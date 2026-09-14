@@ -54,6 +54,22 @@ func (s *Session) Lock() {
 	s.LastUsed = time.Now()
 }
 
+// tryLock acquires the session for exclusive use without blocking, marking it
+// active so the matching Unlock/Release can clear the flag.  Every checkout
+// path (Acquire/Bind) must go through here: Unlock() gates on the active
+// atomic, so acquiring with a bare s.mu.TryLock() would leave the flag false
+// and the mutex permanently leaked on release.  Maintenance probes that only
+// peek at availability keep using s.mu.TryLock() directly and pair it with a
+// raw s.mu.Unlock().
+func (s *Session) tryLock() bool {
+	if !s.mu.TryLock() {
+		return false
+	}
+	s.active.Store(true)
+	s.LastUsed = time.Now()
+	return true
+}
+
 // Unlock unlocks the session.  Idempotent: calling Unlock on an already
 // unlocked session is a no-op.  This guards against double-release when a
 // request's release closure is invoked more than once (e.g. an internal
@@ -215,8 +231,15 @@ func (p *Pool) createSession() (*Session, error) {
 		convID, sessID, err := client.CreateSession(ctx, p.config.AgentPreset)
 		if err != nil {
 			cancel()
+			// A transient transport stall is not the fingerprint's fault: retry
+			// with a fresh fingerprint (continue) without exhausting this one,
+			// so one upstream blip never burns a 24h cooling slot.  Quota errors
+			// are the fingerprint's fault and do exhaust it.
 			if upstream.IsQuotaError(err) {
 				p.exhaustFingerprint(sig)
+				continue
+			}
+			if upstream.IsTransientError(err) {
 				continue
 			}
 			return nil, err
@@ -225,6 +248,9 @@ func (p *Pool) createSession() (*Session, error) {
 			cancel()
 			if upstream.IsQuotaError(err) {
 				p.exhaustFingerprint(sig)
+				continue
+			}
+			if upstream.IsTransientError(err) {
 				continue
 			}
 			return nil, fmt.Errorf("init session: %w", err)
@@ -316,7 +342,7 @@ func (p *Pool) Acquire(ctx context.Context) (*Session, error) {
 			if p.freeStale(now, s) {
 				continue // expired
 			}
-			if s.mu.TryLock() {
+			if s.tryLock() {
 				p.mu.Unlock()
 				return s, nil
 			}
@@ -360,7 +386,7 @@ func (p *Pool) Bind(ctx context.Context, key string) (*Session, error) {
 
 		if be, ok := p.binds[key]; ok {
 			s := be.session
-			if s.mu.TryLock() {
+			if s.tryLock() {
 				be.lastUsed = time.Now()
 				p.mu.Unlock()
 				return s, nil
@@ -381,7 +407,7 @@ func (p *Pool) Bind(ctx context.Context, key string) (*Session, error) {
 			if p.freeStale(now, s) {
 				continue
 			}
-			if s.mu.TryLock() {
+			if s.tryLock() {
 				p.free = append(p.free[:i], p.free[i+1:]...)
 				s.bound = true
 				p.binds[key] = &boundEntry{session: s, lastUsed: time.Now()}
