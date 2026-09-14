@@ -405,6 +405,7 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 		var streamErr error
 		toolSeen := make(map[int]bool)     // tool-call index -> first (name/id) delta already sent
 		toolDropped := make(map[int]bool) // tool-call index -> suppressed by name filter
+		emittedToolCall := false          // any tool-call delta actually sent to the client
 
 		// Cancel the SSE stream as soon as this turn ends.  The upstream agent
 		// loop (EdgeOne sandbox tool execution) only starts after turn/end; a
@@ -442,6 +443,7 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 						return
 					}
 					toolSeen[tc.Index] = true
+					emittedToolCall = true
 					delta["role"] = "assistant"
 					delta["content"] = nil
 					delta["tool_calls"] = []any{map[string]any{
@@ -472,6 +474,12 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 		logTools(sessionKey, result.ToolCalls)
 		finishReason := result.FinishReason
 		if finishReason == "" {
+			finishReason = "stop"
+		}
+		// If every native tool call was dropped by the declared-name filter,
+		// the upstream finish reason may still say tool_calls; normalize to
+		// stop so the client never sees finish_reason=tool_calls with no calls.
+		if !textOnly && finishReason == "tool_calls" && !emittedToolCall {
 			finishReason = "stop"
 		}
 		// Streaming fallback for the ToolForge JSON-text protocol: when the
