@@ -29,7 +29,7 @@ func chunkEnv(turn int, chunk map[string]any) SSEEnvelope {
 	})
 }
 
-func runEvents(t *testing.T, chunks []SSEEnvelope, textOnly bool) ChatResult {
+func runEvents(t *testing.T, chunks []SSEEnvelope) ChatResult {
 	t.Helper()
 	envCh := make(chan SSEEnvelope, 32)
 	for _, e := range chunks {
@@ -38,14 +38,17 @@ func runEvents(t *testing.T, chunks []SSEEnvelope, textOnly bool) ChatResult {
 	close(envCh)
 	c := &Client{}
 	cs := &ChatStream{envCh: envCh}
-	res, err := c.StreamEvents(context.Background(), cs, nil, textOnly, 0)
+	res, err := c.StreamEvents(context.Background(), cs, nil, 0)
 	if err != nil {
 		t.Fatalf("StreamEvents: %v", err)
 	}
 	return res
 }
 
-func TestStreamEventsTextOnlyFoldsToolCallsAcrossTurns(t *testing.T) {
+// The upstream is always a plain-text black box: a native tool-call block is
+// folded away, the finish reason is normalized to "stop", and the tool-driven
+// turn does not terminate the round (follow-up text still flows through).
+func TestStreamEventsFoldsToolCallsAcrossTurns(t *testing.T) {
 	chunks := []SSEEnvelope{
 		env("turn/start", map[string]any{"turn": 1}),
 		chunkEnv(1, map[string]any{"type": "text-delta", "text": "Let me check."}),
@@ -57,19 +60,16 @@ func TestStreamEventsTextOnlyFoldsToolCallsAcrossTurns(t *testing.T) {
 		chunkEnv(2, map[string]any{"type": "text-delta", "text": "Final answer."}),
 		env("turn/end", map[string]any{"turn": 2}),
 	}
-	res := runEvents(t, chunks, true)
+	res := runEvents(t, chunks)
 	if res.Text != "Let me check.Final answer." {
-		t.Fatalf("textOnly must keep consuming follow-up turns, got %q", res.Text)
+		t.Fatalf("plain-text mode must keep consuming follow-up turns, got %q", res.Text)
 	}
 	if res.FinishReason != "stop" {
-		t.Fatalf("textOnly must normalize finish reason to stop, got %q", res.FinishReason)
-	}
-	if len(res.ToolCalls) != 0 {
-		t.Fatalf("textOnly must fold tool calls, got %+v", res.ToolCalls)
+		t.Fatalf("finish reason must normalize to stop, got %q", res.FinishReason)
 	}
 }
 
-func TestStreamEventsTextOnlyCleanTurnStopsImmediately(t *testing.T) {
+func TestStreamEventsCleanTurnStopsImmediately(t *testing.T) {
 	chunks := []SSEEnvelope{
 		env("turn/start", map[string]any{"turn": 1}),
 		chunkEnv(1, map[string]any{"type": "text-delta", "text": "Direct answer"}),
@@ -78,29 +78,24 @@ func TestStreamEventsTextOnlyCleanTurnStopsImmediately(t *testing.T) {
 		chunkEnv(2, map[string]any{"type": "text-delta", "text": "should-not-appear"}),
 		env("turn/end", map[string]any{"turn": 2}),
 	}
-	res := runEvents(t, chunks, true)
+	res := runEvents(t, chunks)
 	if res.Text != "Direct answer" {
 		t.Fatalf("a clean turn must return at turn/end, got %q", res.Text)
 	}
 }
 
-func TestStreamEventsDefaultCapturesToolCalls(t *testing.T) {
+func TestStreamEventsReasoningCaptured(t *testing.T) {
 	chunks := []SSEEnvelope{
 		env("turn/start", map[string]any{"turn": 1}),
-		chunkEnv(1, map[string]any{"type": "text-delta", "text": "Let me check."}),
-		chunkEnv(1, map[string]any{"type": "block-start", "blockType": "tool-call"}),
-		chunkEnv(1, map[string]any{"type": "tool-call-delta", "index": 0, "id": "t_1", "name": "read", "argumentsDelta": `{"path":"/x"}`}),
-		chunkEnv(1, map[string]any{"type": "finish", "reason": map[string]any{"kind": "tool-calls"}}),
+		chunkEnv(1, map[string]any{"type": "reasoning-delta", "text": "thinking..."}),
+		chunkEnv(1, map[string]any{"type": "text-delta", "text": "answer"}),
 		env("turn/end", map[string]any{"turn": 1}),
 	}
-	res := runEvents(t, chunks, false)
-	if res.FinishReason != "tool_calls" {
-		t.Fatalf("default mode must keep tool_calls finish, got %q", res.FinishReason)
+	res := runEvents(t, chunks)
+	if res.Reasoning != "thinking..." {
+		t.Fatalf("reasoning must be preserved, got %q", res.Reasoning)
 	}
-	if len(res.ToolCalls) != 1 || res.ToolCalls[0].Name != "read" || res.ToolCalls[0].Arguments != `{"path":"/x"}` {
-		t.Fatalf("expected one read tool call, got %+v", res.ToolCalls)
-	}
-	if res.Text != "Let me check." {
+	if res.Text != "answer" {
 		t.Fatalf("text must be preserved, got %q", res.Text)
 	}
 }
@@ -116,10 +111,24 @@ func TestBuildDirectiveNoToolsSuppressesAgentLoop(t *testing.T) {
 
 func TestBuildDirectiveWithToolsKeepsProtocol(t *testing.T) {
 	d := BuildDirective(`[{"type":"function","function":{"name":"read_file","description":"read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]`)
-	if !strings.Contains(d, "read_file") {
+	if !strings.Contains(d, "- read_file:") {
 		t.Fatalf("tools directive must list declared tool names:\n%s", d)
+	}
+	if !strings.Contains(d, TCStart) || !strings.Contains(d, TCArgsS) {
+		t.Fatalf("tools directive must carry the delimiter protocol:\n%s", d)
+	}
+	// Compact schema (no spaces) so the model treats it as a machine template.
+	if !strings.Contains(d, `"properties":{"path":{"type":"string"}}`) {
+		t.Fatalf("tools directive must render the parameters schema compactly:\n%s", d)
 	}
 	if strings.Contains(d, "NEVER emit tool calls") {
 		t.Fatalf("tools directive must enable the tool protocol, not forbid it:\n%s", d)
+	}
+}
+
+func TestBuildDirectiveUnparseableToolsFallsBack(t *testing.T) {
+	d := BuildDirective("not-json")
+	if !strings.Contains(d, "NEVER emit tool calls") {
+		t.Fatalf("unparseable tools must fall back to the plain directive:\n%s", d)
 	}
 }

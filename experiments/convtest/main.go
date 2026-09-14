@@ -24,7 +24,7 @@ func chat(ctx context.Context, c *upstream.Client, sessionID, convID, text strin
 		return "", fmt.Errorf("start chat: %w", err)
 	}
 	defer cs.Cancel()
-	res, err := c.StreamEvents(ctx2, cs, nil, true, 0)
+	res, err := c.StreamEvents(ctx2, cs, nil, 0)
 	if err != nil {
 		return "", err
 	}

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"edgeone2api/internal/auth"
 	"edgeone2api/internal/config"
@@ -126,6 +127,7 @@ type openaiChatRequest struct {
 	Temperature     float64         `json:"temperature"`
 	ReasoningEffort string          `json:"reasoning_effort"`
 	Tools           []openaiTool    `json:"tools"`
+	ToolChoice      json.RawMessage `json:"tool_choice"`
 }
 
 type openaiTool struct {
@@ -291,18 +293,19 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	chatID := "chatcmpl-" + randHex(24)
 	created := time.Now().Unix()
 
-	// Dual mode (workbuddy2api-style tool aggregation):
-	//   - No tools declared -> kuku2api-style plain text (content + reasoning,
-	//     no tool_calls ever).
-	//   - Tools declared    -> the model declares tool_calls via the
-	//     ToolForge JSON-text protocol; the gateway parses them and returns
-	//     standard OpenAI tool_calls to the client for execution.  The EdgeOne
-	//     sandbox is never invoked (directive forbids native tools / agent
-	//     loop, and the SSE stream is cancelled as soon as the turn ends).
-	//     Tool results come back as follow-up role=tool messages.
+	// Tool calling is emulated in the prompt layer, kuku2api-style: the
+	// upstream is always treated as a plain-text black box (it has no native
+	// `tools` parameter, and its persona guards against being driven as a tool
+	// executor).  When the client declares tools, the definitions are rendered
+	// into a private-delimiter text protocol injected ahead of the conversation
+	// and the reply is parsed back into standard OpenAI tool_calls for the
+	// client to execute.  Tool results arrive as follow-up role=tool messages.
+	// Native tool-call blocks are never surfaced: the upstream is always
+	// handled as plain text, and
+	// the SSE stream is cancelled as soon as the turn ends so the upstream
+	// agent loop never runs.
 	toolsJSON := ""
-	textOnly := len(req.Tools) == 0
-	if len(req.Tools) > 0 {
+	if len(req.Tools) > 0 && !toolChoiceNone(req.ToolChoice) {
 		if b, err := json.Marshal(req.Tools); err == nil {
 			toolsJSON = string(b)
 		}
@@ -314,18 +317,18 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				return s.pool.Bind(ctx, sessionKey)
 			}
 			return s.pool.Acquire(ctx)
-		}, toolsJSON, textOnly)
+		}, toolsJSON)
 	} else {
 		s.nonStreamChat(w, ctx, session, chatID, model, created, req.Messages, sessionKey, release, func(ctx context.Context) (*auth.Session, error) {
 			if bound {
 				return s.pool.Bind(ctx, sessionKey)
 			}
 			return s.pool.Acquire(ctx)
-		}, toolsJSON, textOnly)
+		}, toolsJSON)
 	}
 }
 
-func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, msgs []openaiMessage, sessionKey string, release func(bool), reacquire func(context.Context) (*auth.Session, error), toolsJSON string, textOnly bool) {
+func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, msgs []openaiMessage, sessionKey string, release func(bool), reacquire func(context.Context) (*auth.Session, error), toolsJSON string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		release(false)
@@ -377,18 +380,29 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 		}()
 
 		var sb strings.Builder
-		var result upstream.ChatResult
 		var streamErr error
-		toolSeen := make(map[int]bool) // tool-call index -> first (name/id) delta already sent
+
+		// We cannot tell a plain-text tool-call block from prose until its
+		// opening delimiter arrives, so hold back a small tail window: text
+		// older than the window streams immediately (no added latency for
+		// ordinary answers), while a possible delimiter prefix stays buffered.
+		// Once the delimiter appears in the raw stream, everything from it on
+		// (the whole tool-call block) is withheld from the client and only the
+		// parsed tool_calls are emitted at the end.  Mirrors kuku2api's
+		// "buffer, then parse" streaming behaviour without penalising plain text.
+		var raw strings.Builder
+		var sent int  // bytes of raw already emitted to the client as content
+		var gate int  // bytes of raw confirmed free of the opening delimiter
+		const tail = 64
 
 		// Cancel the SSE stream as soon as this turn ends.  The upstream agent
-		// loop (EdgeOne sandbox tool execution) only starts after turn/end; a
+		// loop (platform sandbox tool execution) only starts after turn/end; a
 		// cancelled stream cuts it off — the sandbox never runs.  This is the
 		// enforcement half of the "tools run on the client, not in the sandbox"
 		// design; the directive (BuildDirective) is the prevention half.
 		defer cs.Cancel()
 
-		result, streamErr = session.Client.StreamEvents(ctx, cs, func(chunk upstream.AssistantChunk) {
+		_, streamErr = session.Client.StreamEvents(ctx, cs, func(chunk upstream.AssistantChunk) {
 			if chunk.IsDone {
 				return // finish chunk is emitted after StreamEvents returns
 			}
@@ -396,60 +410,74 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 			delta := map[string]any{}
 			if chunk.Text != "" {
 				sb.WriteString(chunk.Text)
-				delta["content"] = chunk.Text
+				raw.WriteString(chunk.Text)
+				r := raw.String()
+				// Never gate past the first opening delimiter: once it appears,
+				// the tool-call block starts there and must not stream out.
+				if idx := strings.Index(r, upstream.TCStart); idx >= 0 {
+					gate = idx
+				} else {
+					limit := len(r) - tail
+					if limit < 0 {
+						limit = 0
+					}
+					// Back off so a partial delimiter (which always begins with the
+					// same leading codepoint) also stays buffered.
+					if part := partialDelimSuffix(r, upstream.TCStart); part > 0 {
+						limit -= part
+						if limit < 0 {
+							limit = 0
+						}
+					}
+					if limit > gate {
+						gate = limit
+					}
+				}
+				if gate > sent {
+					// Never split a multi-byte UTF-8 rune: slicing mid-rune would
+					// corrupt the text (json.Marshal replaces the broken bytes with
+					// U+FFFD).  Align the cut back to a rune boundary.
+					for gate > sent && !utf8.RuneStart(r[gate]) {
+						gate--
+					}
+				}
+				if gate > sent {
+					out := r[sent:gate]
+					sent = gate
+					if out != "" {
+						delta["content"] = out
+					}
+				}
 			}
 			if chunk.Reasoning != "" {
 				delta["reasoning_content"] = chunk.Reasoning
-			}
-			if chunk.ToolCall != nil && !textOnly {
-				tc := chunk.ToolCall
-				if tc.Name != "" && !toolSeen[tc.Index] {
-					// First delta for this tool call: id/type/name + any argument text.
-					toolSeen[tc.Index] = true
-					delta["role"] = "assistant"
-					delta["content"] = nil
-					delta["tool_calls"] = []any{map[string]any{
-						"index":    tc.Index,
-						"id":       tc.ID,
-						"type":     "function",
-						"function": map[string]any{"name": tc.Name, "arguments": tc.ArgumentsDelta},
-					}}
-				} else if tc.ArgumentsDelta != "" {
-					// Streaming argument fragment for an already-announced call.
-					delta["tool_calls"] = []any{map[string]any{
-						"index":    tc.Index,
-						"function": map[string]any{"arguments": tc.ArgumentsDelta},
-					}}
-				} else if tc.IsComplete && tc.Arguments != "" {
-					// Final block-end: full arguments (authoritative replacement).
-					delta["tool_calls"] = []any{map[string]any{
-						"index":    tc.Index,
-						"function": map[string]any{"arguments": tc.Arguments},
-					}}
-				}
 			}
 			if len(delta) > 0 {
 				emitSSE(w, chatID, model, created, delta)
 				flusher.Flush()
 			}
-		}, textOnly, s.streamIdle)
-		logTools(sessionKey, result.ToolCalls)
-		finishReason := result.FinishReason
-		if finishReason == "" {
-			finishReason = "stop"
-		}
-		// Streaming fallback for the ToolForge JSON-text protocol: when the
-		// model answered with a tool_calls JSON as plain text (no native
-		// tool-call blocks), the JSON already streamed out as content.  Emit
-		// the parsed tool_calls as a final delta so OpenAI clients see a
-		// structured tool_calls turn and finish_reason=tool_calls, matching
-		// the non-streaming aggregation.
-		if !textOnly && finishReason != "tool_calls" {
-			if calls := parseToolCalls(sb.String()); calls != nil {
-				emitToolCallsSSE(w, chatID, model, created, calls)
+		}, s.streamIdle)
+		finishReason := "stop"
+		// Parse the buffered reply back into standard tool_calls.  The tool-call
+		// block (delimiters included) never reached the client, so only the
+		// visible head text was streamed; a detected call yields finish=tool_calls.
+		content, calls := parseToolCalls(sb.String())
+		// Flush the held-back tail: for a direct answer it is the rest of the
+		// visible text; when a call was found it is the head text that preceded
+		// the (withheld) tool-call block.
+		if len(calls) == 0 {
+			if r := raw.String(); sent < len(r) {
+				emitSSE(w, chatID, model, created, map[string]any{"content": r[sent:]})
 				flusher.Flush()
-				finishReason = "tool_calls"
 			}
+		} else if sent < len(content) {
+			emitSSE(w, chatID, model, created, map[string]any{"content": content[sent:]})
+			flusher.Flush()
+		}
+		if len(calls) > 0 {
+			emitToolCallsSSE(w, chatID, model, created, calls)
+			flusher.Flush()
+			finishReason = "tool_calls"
 		}
 		if streamErr != nil {
 			log.Printf("[STREAM] error: %v", streamErr)
@@ -457,7 +485,7 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 		} else {
 			success = true
 			if sessionKey != "" {
-				s.pool.AppendHistory(sessionKey, session.SessionID, userText, sb.String())
+				s.pool.AppendHistory(sessionKey, session.SessionID, userText, content)
 			}
 		}
 
@@ -470,7 +498,7 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 	writeJSON(w, http.StatusBadGateway, map[string]any{"error": "upstream quota exceeded, retry later"})
 }
 
-func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, msgs []openaiMessage, sessionKey string, release func(bool), reacquire func(context.Context) (*auth.Session, error), toolsJSON string, textOnly bool) {
+func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, msgs []openaiMessage, sessionKey string, release func(bool), reacquire func(context.Context) (*auth.Session, error), toolsJSON string) {
 	var result upstream.ChatResult
 	var err error
 
@@ -500,8 +528,7 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 		// a cancelled stream cuts it off.  Tools execute on the client, never
 		// in the sandbox.
 		defer cs.Cancel()
-		result, err = session.Client.StreamEvents(ctx, cs, nil, textOnly, 0)
-		logTools(sessionKey, result.ToolCalls)
+		result, err = session.Client.StreamEvents(ctx, cs, nil, 0)
 		if err != nil {
 			log.Printf("[CHAT] stream error: %v", err)
 		}
@@ -522,22 +549,18 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 	if result.Reasoning != "" {
 		msg["reasoning_content"] = result.Reasoning
 	}
+	// kuku2api-style prompt-layer tool parsing: the model declares tool calls
+	// as a private-delimiter text block at the end of its reply.  Parse it
+	// back into standard OpenAI tool_calls for the client to execute.  The
+	// delimiters are stripped from the returned content; no native tool-call
+	// block is ever surfaced (native tool-call blocks are always folded away).
 	finish := "stop"
-	if !textOnly {
-		// workbuddy2api-style tool aggregation: prefer upstream-native
-		// tool-call events (real tool-call blocks), falling back to the
-		// ToolForge JSON-text protocol (the model declares a tool_calls JSON
-		// as plain text).  Names pass through untouched — no translation.
-		// The calls are returned to the client for execution; the EdgeOne
-		// sandbox never runs them.
-		if calls := toOpenAIToolCalls(result.ToolCalls); len(calls) > 0 {
-			msg["content"] = nil
-			msg["tool_calls"] = calls
-			finish = "tool_calls"
-		} else if calls := parseToolCalls(result.Text); calls != nil {
-			msg["content"] = nil
-			msg["tool_calls"] = calls
-			finish = "tool_calls"
+	if content, calls := parseToolCalls(result.Text); len(calls) > 0 {
+		msg["content"] = nil
+		msg["tool_calls"] = calls
+		finish = "tool_calls"
+		if sessionKey != "" {
+			s.pool.AppendHistory(sessionKey, session.SessionID, userText, content)
 		}
 	}
 
@@ -568,8 +591,8 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 // --- Message conversion ---
 
 // buildItems assembles the prompt for a session: the system directive
-// (plain-text posture, or ToolForge tool-declaration protocol when the client
-// declared tools), an optional cache-hit replay of the previous dialog
+// (plain-text posture, or the kuku2api private-delimiter tool protocol when the
+// client declared tools), an optional cache-hit replay of the previous dialog
 // history, then the request messages.  Replay is recomputed per session so a
 // fresh session created by a quota retry inherits the cached context
 // automatically.
@@ -643,29 +666,81 @@ func convertMessages(msgs []openaiMessage) []upstream.ContentItem {
 	return items
 }
 
-// toOpenAIToolCalls converts upstream-native assistant tool calls into the
-// OpenAI tool_calls message shape returned to the client.  Names pass
-// through untouched (workbuddy2api style — no translation layer).
-func toOpenAIToolCalls(tcs []upstream.AssistantToolCall) []openaiToolCall {
-	if len(tcs) == 0 {
-		return nil
+// toolChoiceNone reports whether the client sent tool_choice:"none", in which
+// case the tool protocol must not be injected (mirrors kuku2api).
+func toolChoiceNone(raw json.RawMessage) bool {
+	t := strings.TrimSpace(string(raw))
+	return t == `"none"`
+}
+
+// parseToolCalls parses the model's text output for the kuku2api-style
+// private-delimiter tool-call protocol.
+//
+// It returns the remaining visible text (with the tool-call block stripped)
+// and the parsed calls.  When no block is present the text is returned
+// unchanged and calls is empty — meaning the model answered directly.  A
+// block only counts if its arguments decode to a JSON object, so ordinary
+// prose can never be mistaken for a call.
+func parseToolCalls(text string) (string, []openaiToolCall) {
+	if !strings.Contains(text, upstream.TCStart) {
+		return text, nil
 	}
-	calls := make([]openaiToolCall, 0, len(tcs))
-	for i, tc := range tcs {
-		id := tc.ID
-		if id == "" {
-			id = fmt.Sprintf("call_%s_%d", randHex(6), i)
+	head := strings.SplitN(text, upstream.TCStart, 2)[0]
+
+	var calls []openaiToolCall
+	for i, blk := range strings.Split(text, upstream.TCStart)[1:] {
+		blk = strings.SplitN(blk, upstream.TCEnd, 2)[0]
+		if !strings.Contains(blk, upstream.TCNameS) || !strings.Contains(blk, upstream.TCArgsS) {
+			continue
+		}
+		nameParts := strings.SplitN(blk, upstream.TCNameS, 2)
+		if len(nameParts) < 2 {
+			continue
+		}
+		name := strings.TrimSpace(strings.SplitN(nameParts[1], upstream.TCNameE, 2)[0])
+		argsParts := strings.SplitN(blk, upstream.TCArgsS, 2)
+		if len(argsParts) < 2 {
+			continue
+		}
+		args := strings.TrimSpace(strings.SplitN(argsParts[1], upstream.TCArgsE, 2)[0])
+		if name == "" {
+			continue
+		}
+		// Arguments must be a JSON object; otherwise drop the block (avoids
+		// mistaking body text for a call).
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(args), &obj); err != nil {
+			continue
 		}
 		calls = append(calls, openaiToolCall{
-			ID:   id,
+			ID:   fmt.Sprintf("call_%s_%d", randHex(16), i),
 			Type: "function",
 			Function: openaiToolCallFn{
-				Name:      tc.Name,
-				Arguments: tc.Arguments,
+				Name:      name,
+				Arguments: args,
 			},
 		})
 	}
-	return calls
+	if len(calls) == 0 {
+		return text, nil
+	}
+	return strings.TrimSpace(head), calls
+}
+
+// partialDelimSuffix returns the length of the longest proper prefix of delim
+// that is a suffix of s.  Used to hold back a reply tail that might be the
+// start of a tool-call delimiter split across stream chunks.
+func partialDelimSuffix(s, delim string) int {
+	max := len(delim) - 1
+	if max > len(s) {
+		max = len(s)
+	}
+	for n := max; n > 0; n-- {
+		if strings.HasSuffix(s, delim[:n]) {
+			return n
+		}
+	}
+	return 0
 }
 
 func extractContent(raw json.RawMessage) string {
@@ -703,86 +778,19 @@ func lastUserMessage(msgs []openaiMessage) string {
 	return ""
 }
 
-// logTools records any tool calls the upstream model actually emitted for a
-// request.  The expected posture is zero native tool-call events: the
-// directive makes the model declare tool calls as JSON text in the first
-// turn instead of entering the platform agent loop.
-func logTools(sessionKey string, calls []upstream.AssistantToolCall) {
-	if len(calls) == 0 {
-		log.Printf("[TOOLS] key=%s tool_calls=none", sessionKey)
-		return
-	}
-	for _, tc := range calls {
-		args := tc.Arguments
-		if len(args) > 160 {
-			args = args[:160] + "..."
-		}
-		log.Printf("[TOOLS] key=%s tool_call name=%s args=%s", sessionKey, tc.Name, args)
-	}
-}
-
-// formatAssistantToolCalls renders a previous assistant tool_calls turn as a
-// stable text fragment (id + name + arguments) that the upstream model can
-// parse and correlate with the subsequent tool result.
+// formatAssistantToolCalls renders a previous assistant tool_calls turn as the
+// same private-delimiter protocol the model is asked to emit, so the upstream
+// sees its own prior call and can correlate the subsequent tool result.
 func formatAssistantToolCalls(calls []openaiToolCall) string {
 	var sb strings.Builder
-	sb.WriteString("[Assistant Tool Calls - issued earlier]\n")
+	sb.WriteString("[Assistant tool call issued earlier]\n")
 	for _, c := range calls {
-		sb.WriteString("  id=" + c.ID + " name=" + c.Function.Name)
-		if c.Function.Arguments != "" {
-			sb.WriteString(" arguments=" + c.Function.Arguments)
-		}
-		sb.WriteString("\n")
+		sb.WriteString(upstream.TCStart + "\n")
+		sb.WriteString(upstream.TCNameS + c.Function.Name + upstream.TCNameE + "\n")
+		sb.WriteString(upstream.TCArgsS + c.Function.Arguments + upstream.TCArgsE + "\n")
+		sb.WriteString(upstream.TCEnd + "\n")
 	}
 	return sb.String()
-}
-
-// parseToolCalls tries to interpret the model's text output as a tool_calls
-// JSON (the ToolForge declared-tool protocol).  It tolerates a surrounding
-// code fence.  Returns nil when the text is not a tool_calls JSON, meaning
-// the model answered directly.
-func parseToolCalls(text string) []openaiToolCall {
-	t := strings.TrimSpace(text)
-	t = strings.TrimPrefix(t, "```json")
-	t = strings.TrimPrefix(t, "```")
-	t = strings.TrimSuffix(t, "```")
-	t = strings.TrimSpace(t)
-	var parsed struct {
-		ToolCalls []struct {
-			ID       string `json:"id"`
-			Type     string `json:"type"`
-			Function struct {
-				Name      string `json:"name"`
-				Arguments string `json:"arguments"`
-			} `json:"function"`
-		} `json:"tool_calls"`
-	}
-	if err := json.Unmarshal([]byte(t), &parsed); err != nil {
-		return nil
-	}
-	if len(parsed.ToolCalls) == 0 {
-		return nil
-	}
-	calls := make([]openaiToolCall, 0, len(parsed.ToolCalls))
-	for i, c := range parsed.ToolCalls {
-		typ := c.Type
-		if typ == "" {
-			typ = "function"
-		}
-		id := c.ID
-		if id == "" {
-			id = fmt.Sprintf("call_%s_%d", randHex(6), i)
-		}
-		calls = append(calls, openaiToolCall{
-			ID:   id,
-			Type: typ,
-			Function: openaiToolCallFn{
-				Name:      c.Function.Name,
-				Arguments: c.Function.Arguments,
-			},
-		})
-	}
-	return calls
 }
 
 // --- SSE helpers ---
@@ -809,8 +817,8 @@ func emitSSE(w http.ResponseWriter, chatID, model string, created int64, delta m
 }
 
 // emitToolCallsSSE sends the complete tool_calls payload as a streaming chunk.
-// Used by the streaming fallback when the model declared tool_calls via the
-// ToolForge JSON-text protocol instead of native tool-call blocks.
+// Used when the model declared tool_calls via the private-delimiter text
+// protocol instead of native tool-call blocks.
 func emitToolCallsSSE(w http.ResponseWriter, chatID, model string, created int64, calls []openaiToolCall) {
 	delta := map[string]any{
 		"role":       "assistant",

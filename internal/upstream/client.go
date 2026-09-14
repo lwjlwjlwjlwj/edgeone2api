@@ -451,31 +451,21 @@ func randHex(n int) string {
 	return hex.EncodeToString(b)[:n]
 }
 
-// AssistantChunk is a parsed text/reasoning/tool-call delta from an assistant/chunk event
+// AssistantChunk is a parsed text/reasoning delta from an assistant/chunk event
+// (tool-call blocks are folded away and never surface here).
 type AssistantChunk struct {
 	Text         string
 	Reasoning    string
-	ToolCall     *AssistantToolCall
 	IsDone       bool
-	FinishReason string // "stop" | "tool_calls"
+	FinishReason string // always "stop" — tool calls travel via the text protocol
 }
 
-// AssistantToolCall represents a tool call from the model
-type AssistantToolCall struct {
-	Index          int
-	ID             string
-	Name           string
-	Arguments      string // accumulated arguments
-	ArgumentsDelta string // current delta
-	IsComplete     bool   // true for block-end (full arguments available)
-}
-
-// ChatResult holds the final outcome of a chat turn
+// ChatResult holds the final outcome of a chat turn (plain text only: native
+// tool-call events are folded away, so there is no ToolCalls field).
 type ChatResult struct {
 	Text         string
 	Reasoning    string // accumulated reasoning-delta text (thinking trace)
-	FinishReason string // "stop" | "tool_calls"
-	ToolCalls    []AssistantToolCall
+	FinishReason string // always "stop"
 }
 
 // ChatStream holds an active chat session: SSE stream + prompt context
@@ -515,7 +505,7 @@ func (c *Client) InitSession(ctx context.Context, sessionID, convID string) erro
 		return err
 	}
 	defer cs.Cancel()
-	_, err = c.StreamEvents(ctx, cs, nil, false, 0)
+	_, err = c.StreamEvents(ctx, cs, nil, 0)
 	return err
 }
 
@@ -529,12 +519,14 @@ func (cs *ChatStream) Cancel() {
 // StreamEvents consumes the SSE event stream, yielding deltas via onDelta,
 // until the turn ends. Returns the accumulated result.
 //
-// When textOnly is true (kuku2api-style plain-text proxy mode), tool-call
-// events are folded away: native tool blocks are dropped, the finish reason
-// is normalized to "stop", and a tool-driven turn does not terminate the
-// round — the stream keeps being consumed so any follow-up text produced by
-// the upstream agent loop can still flow through. The client therefore never
-// sees a bare tool_calls chunk or a blank agent-loop reply.
+// The upstream is always treated as a plain-text black box (kuku2api posture):
+// native tool-call blocks are folded away, the finish reason is normalized to
+// "stop", and a tool-driven turn does not terminate the round — the stream
+// keeps being consumed so any follow-up text produced by the upstream agent
+// loop can still flow through. The client therefore never sees a bare
+// tool_calls chunk or a blank agent-loop reply.  Tool calls, when the client
+// declares tools, are decoded separately from the plain-text reply (see
+// server.parseToolCalls).
 //
 // idleTimeout guards against a dead upstream: if no SSE event arrives for
 // that long, the stream is aborted with an error.  It resets on every event,
@@ -543,14 +535,11 @@ func (cs *ChatStream) Cancel() {
 // disconnect, non-streaming timeout) is the only other stop condition.
 //
 // ctx can be used for timeout; nil means no deadline.
-func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(AssistantChunk), textOnly bool, idleTimeout time.Duration) (ChatResult, error) {
+func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(AssistantChunk), idleTimeout time.Duration) (ChatResult, error) {
 	var sb strings.Builder
 	var reasoningSb strings.Builder
 	var turn int
-	finishReason := "stop"
-	toolCalls := make(map[int]*AssistantToolCall)
-	var toolCallOrder []int // preserves the order tool calls first appear
-	droppedTools := false   // textOnly: a tool-call was folded this turn
+	droppedTools := false // a tool-call block was folded this turn
 
 	var idleTimer *time.Timer
 	var idleC <-chan time.Time
@@ -573,13 +562,7 @@ func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(
 	}
 
 	result := func() ChatResult {
-		ordered := make([]AssistantToolCall, 0, len(toolCallOrder))
-		for _, idx := range toolCallOrder {
-			if tc, ok := toolCalls[idx]; ok && tc.Name != "" {
-				ordered = append(ordered, *tc)
-			}
-		}
-		return ChatResult{Text: sb.String(), Reasoning: reasoningSb.String(), FinishReason: finishReason, ToolCalls: ordered}
+		return ChatResult{Text: sb.String(), Reasoning: reasoningSb.String(), FinishReason: "stop"}
 	}
 
 	for {
@@ -656,100 +639,29 @@ func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(
 					}
 					json.Unmarshal(d.Chunk, &cd)
 					if cd.BlockType == "tool-call" {
-						if textOnly {
-							droppedTools = true
-							log.Printf("[STREAM] textOnly: dropping tool-call block")
-							continue
-						}
-						if onDelta != nil {
-							onDelta(AssistantChunk{ToolCall: &AssistantToolCall{}})
-						}
-					}
-				case "tool-call-delta":
-					var cd struct {
-						Index          int    `json:"index"`
-						ID             string `json:"id"`
-						Name           string `json:"name"`
-						ArgumentsDelta string `json:"argumentsDelta"`
-					}
-					json.Unmarshal(d.Chunk, &cd)
-					if textOnly {
 						droppedTools = true
+						log.Printf("[STREAM] dropping tool-call block (plain-text posture)")
 						continue
 					}
-					tc := toolCalls[cd.Index]
-					if tc == nil {
-						tc = &AssistantToolCall{Index: cd.Index}
-						toolCalls[cd.Index] = tc
-						toolCallOrder = append(toolCallOrder, cd.Index)
-					}
-					if cd.ID != "" {
-						tc.ID = cd.ID
-					}
-					if cd.Name != "" {
-						tc.Name = cd.Name
-					}
-					if cd.ArgumentsDelta != "" {
-						tc.ArgumentsDelta = cd.ArgumentsDelta
-						tc.Arguments += cd.ArgumentsDelta
-					}
-					finishReason = "tool_calls"
-					if onDelta != nil {
-						onDelta(AssistantChunk{
-							ToolCall: &AssistantToolCall{
-								Index:          cd.Index,
-								ID:             tc.ID,
-								Name:           tc.Name,
-								ArgumentsDelta: cd.ArgumentsDelta,
-								Arguments:      tc.Arguments,
-							},
-						})
-					}
+				case "tool-call-delta":
+					// Native tool-call streaming is never surfaced — fold it away.
+					droppedTools = true
+					continue
 				case "block-end":
 					var cd struct {
 						Index int `json:"index"`
 						Block *struct {
-							Type      string `json:"type"`
-							ID        string `json:"id"`
-							Name      string `json:"name"`
-							Arguments string `json:"arguments"`
+							Type string `json:"type"`
 						} `json:"block"`
 					}
 					json.Unmarshal(d.Chunk, &cd)
-					if textOnly {
-						if cd.Block != nil && cd.Block.Type == "tool-call" {
-							droppedTools = true
-						}
-						continue
-					}
 					if cd.Block != nil && cd.Block.Type == "tool-call" {
-						if tc, ok := toolCalls[cd.Index]; ok && cd.Block.Arguments != "" {
-							tc.Arguments = cd.Block.Arguments
-							tc.ID = cd.Block.ID
-							tc.Name = cd.Block.Name
-						}
-						if onDelta != nil {
-							onDelta(AssistantChunk{
-								ToolCall: &AssistantToolCall{
-									Index:      cd.Index,
-									ID:         cd.Block.ID,
-									Name:       cd.Block.Name,
-									Arguments:  cd.Block.Arguments,
-									IsComplete: true,
-								},
-							})
-						}
+						droppedTools = true
 					}
+					continue
 				case "finish":
-					var cd struct {
-						Reason struct {
-							Kind string `json:"kind"`
-						} `json:"reason"`
-					}
-					json.Unmarshal(d.Chunk, &cd)
-					if cd.Reason.Kind == "tool-calls" && !textOnly {
-						finishReason = "tool_calls"
-					}
+					// finish_reason is always normalized to "stop"; the tool-call
+					// signal reaches the client via the plain-text protocol.
 				}
 
 			case "turn/end":
@@ -758,11 +670,11 @@ func (c *Client) StreamEvents(ctx context.Context, cs *ChatStream, onDelta func(
 				}
 				json.Unmarshal(se.Event.Data, &d)
 				if turn > 0 && d.Turn == turn {
-					if textOnly && droppedTools {
+					if droppedTools {
 						continue // tool-driven turn: keep consuming follow-up turns
 					}
 					if onDelta != nil {
-						onDelta(AssistantChunk{IsDone: true, FinishReason: finishReason})
+						onDelta(AssistantChunk{IsDone: true, FinishReason: "stop"})
 					}
 					return result(), nil
 				}
