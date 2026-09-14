@@ -94,6 +94,19 @@ func (s *Session) MarkQuotaExceeded() {
 	s.quotaExceeded = true
 }
 
+// MarkGone flags the session for immediate recycling on the next
+// Release/ReleaseBind call *without* exhausting its browser fingerprint.
+//
+// Used when the upstream reports the session no longer exists.  The harness
+// reaps idle sessions server-side well before our own FreeTTL window, so a
+// plain "session not found" is normal lifecycle, not a quota event: burning
+// the fingerprint for 24h over it would slowly poison the pool with cooling
+// entries for sessions that never hit any limit.
+func (s *Session) MarkGone() {
+	s.ReqCount = 999999
+	s.quotaExceeded = false
+}
+
 // PoolConfig configures the session pool
 type PoolConfig struct {
 	MinSize          int

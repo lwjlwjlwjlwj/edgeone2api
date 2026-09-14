@@ -364,3 +364,27 @@ func TestReleaseBindDoesNotLeakSessionLock(t *testing.T) {
 	}
 	p.ReleaseBind("k", s2, true)
 }
+
+// Regression: a server-side "session not found" (the harness reaping an idle
+// session) must recycle the session without burning its fingerprint for 24h.
+// Treating it as quota poisons the pool with cooling fingerprints over
+// ordinary lifecycle events — observed as spurious 502s after the container
+// had been idle ~20 minutes.
+func TestMarkGoneDoesNotExhaustFingerprint(t *testing.T) {
+	s := &Session{SessionID: "s1", ConversationID: "c1", CreatedAt: time.Now()}
+	s.MarkGone()
+	if s.quotaExceeded {
+		t.Fatal("MarkGone must not flag quotaExceeded")
+	}
+	if s.ReqCount < 1000 {
+		t.Fatalf("MarkGone must force recycling, ReqCount=%d", s.ReqCount)
+	}
+}
+
+func TestMarkQuotaExceededFlagsFingerprintBurn(t *testing.T) {
+	s := &Session{SessionID: "s1", ConversationID: "c1", CreatedAt: time.Now()}
+	s.MarkQuotaExceeded()
+	if !s.quotaExceeded {
+		t.Fatal("MarkQuotaExceeded must flag quotaExceeded")
+	}
+}
