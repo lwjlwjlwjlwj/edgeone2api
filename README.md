@@ -1,114 +1,130 @@
 # edgeone2api
 
-> EdgeOne Makers Agent 的 OpenAI 兼容 API 网关，Go 实现。
+把 EdgeOne Agents（DeepSeek Harness）包装成 OpenAI 兼容 API 的网关。
 
-逆向自 EdgeOne Makers / DeepSeek Harness Web Chat 的 `session.prompt` RPC 接口，将其封装为标准 OpenAI 兼容 `/v1/chat/completions` 端点，支持 SSE 流式输出，免登录即可调用 Makers Agent 托管的 DeepSeek 系列模型。
+上游是带 agent loop 的对话引擎，原生输出流式 block 事件（文本、推理、工具调用）。
+本网关负责两件事：**把 agent 协议翻译成 OpenAI 标准协议**，以及**保证工具只在客户端执行、上游沙箱永不介入**。
 
-## 功能特性
+```
+浏览器 / 任意 OpenAI 客户端
+        │  HTTP /v1/chat/completions（OpenAI 格式）
+        ▼
+   edgeone2api  ── 会话池（4~32 弹性，指纹冷却）──►  EdgeOne Agents
+        ▲                                                │
+        └────── SSE block 事件（text / reasoning / tool-call）┘
+```
 
-- **免登录** — 直接调用 Harness 的 `session.create` / `session.prompt` RPC，无需登录即可使用
-- **多模型支持** — `@makers/deepseek-v4-flash`、`@makers/deepseek-v4-pro`、`@makers/kimi-k2.6`、`@makers/hy3`、`@makers/minimax-m3` 等（通过 `model_map` 配置）
-- **推理强度可调** — 支持 OpenAI 标准 `reasoning_effort` 参数（`off`/`high`/`max`）
-- **浏览器指纹隔离** — 每个会话独立 UA/Sec-CH-UA 指纹，上游将每个会话视为独立浏览器，限流互不影响
-- **弹性凭证池** — 会话池自动创建/复用/维护，配额感知轮换（绕过单一会话的用量上限）；会话不足时并发后台扩容，突发请求不排队
-- **SSE 流式** — 流式透传上游事件流；非流式自动聚合 `content`
-- **工具调用** — 原生支持 OpenAI `tools` 参数：客户端声明的工具定义注入系统指令，模型首轮即以 JSON 文本声明工具调用，网关强校验解析为标准 `tool_calls` 返回（ToolForge 风格，首轮截断，一次 LLM 调用即可闭环）；`role:"tool"` 结果回传后自然续接
-- **纯文本模式（对齐 kuku2api）** — 未传 `tools` 的请求按 kuku2api 思路以纯文本黑盒处理：折叠上游一切工具事件、工具驱动的轮次自动续读、`finish_reason` 归一为 `stop`，绝不向客户端泄漏工具协议（无白屏/空回复）
-- **可选鉴权** — 配置 `api_key` 后需 Bearer token 访问
-- **Go 单二进制** — 无外部依赖，`go build` 即得
+## 特性
+
+- **OpenAI 兼容**：`/v1/chat/completions`（流式 + 非流式）、`/v1/models`、`/healthz`
+- **双模式**：
+  - 未声明 `tools` → **纯文本模式**：折叠上游一切工具事件，`finish_reason` 归一为 `stop`，工具驱动的轮次自动续读直到输出正文，永远得到一段完整回答
+  - 声明 `tools` → **工具调用模式**：解析上游原生 tool-call block（或 ToolForge JSON 文本协议），返回标准 `tool_calls` 给客户端执行
+- **工具名白名单 + 别名映射**：上游漂移出的 `bash` / `str_replace_editor` / `mcp__edgeone__*` 等名字，在到达客户端前被校验/改写/丢弃，杜绝"客户端报 Tool not found → 模型编造沙箱被挡"的故障链
+- **会话池**：空闲自动回补到 `pool_min`，突发并发预热到 `pool_max`，浏览器指纹限流后 24h 冷却
+- **会话亲和**：客户端带 `X-Session-Key` 即绑定固定会话，多轮对话上下文连续
+- **会话生命周期健壮性**：上游会话被回收（"session not found"）被识别为生命周期事件而非配额事件，自动换新会话重试，不烧指纹、不 502
+- **安全**：SSE 流在 turn 结束时立即 cancel，上游 agent loop（沙箱工具执行）在启动前即被掐断——工具永远跑在客户端，不在沙箱
 
 ## 快速开始
 
-### 1. 构建 & 配置
+### 1. 配置
+
+```bash
+cp config.example.json config.json
+# 编辑 config.json：至少填 api_key 与 upstream_url
+```
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
+| `listen` | `:7863` | 监听地址 |
+| `api_key` | 空 | 请求鉴权 Bearer token；留空则不做鉴权 |
+| `models` | 见示例 | 对外暴露的模型列表 |
+| `pool_min` / `pool_max` | `2` / `8` | 会话池弹性范围 |
+| `ttl_minutes` | `0` | 会话 TTL（0 = 不过期） |
+| `free_ttl_minutes` | `90` | 空闲会话回收上限（上游约 1.5-2h 销毁空闲会话，早于它回收避免僵尸） |
+| `bind_ttl_minutes` | `30` | 绑定会话空闲回收上限 |
+| `max_req_per_session` | `200` | 单会话最大请求数，超出自动轮换 |
+| `upstream_url` | `https://deepseek-harness.edgeone.cool` | 上游端点 |
+| `agent_preset` | `minimal` | 上游会话预设 |
+| `request_timeout_seconds` | `600` | 非流式整体超时 |
+| `stream_idle_seconds` | `180` | 流式无事件判定死连接 |
+| `default_reasoning_effort` | `off` | 全局推理强度兜底（`off`/`high`/`max`/空） |
+| `request_jitter_ms` | `0` | 发送前随机延迟，伪并发防抖 |
+| `max_concurrent` | `0` | 并发上游请求上限（0 = 不限） |
+| `model_map` | 见示例 | 模型名 → 上游 provider/model 映射，可带每模型 `reasoning_effort` |
+
+所有配置项均支持同名环境变量覆盖（`listen` → `EDGEONE_API_LISTEN`，`api_key` → `EDGEONE_API_KEY`，`models` → `EDGEONE_API_MODELS`，`pool_min` → `EDGEONE_API_POOL_MIN`，依此类推），无需配置文件也可运行。
+
+### 2. 运行
 
 ```bash
 go build -o edgeone2api ./cmd/server
-cp config.example.json config.json
-# 编辑 config.json，设置 api_key（可留空 = 不鉴权）、model_map 等
-```
-
-### 2. 启动服务
-
-```bash
 ./edgeone2api -config config.json
+# 或容器：
+docker build -t edgeone2api .
+docker run -d --name edgeone2api --network host \
+  -v "$PWD/config.json:/app/config.json:ro" \
+  -e EDGEONE_API_LISTEN=:7863 \
+  edgeone2api
 ```
 
-或直接用环境变量（无需配置文件）：
+健康检查：
 
 ```bash
-EDGEONE_API_LISTEN=:7863 EDGEONE_API_POOL_MIN=4 EDGEONE_API_POOL_MAX=32 ./edgeone2api
+curl http://localhost:7863/healthz
+# {"poolSize":4,"status":"ok"}
 ```
 
-### 3. 验证
+## 使用
+
+### 普通对话（无工具）
 
 ```bash
-# 健康检查
-curl -s http://localhost:7863/healthz
-
-# 模型列表
-curl -s http://localhost:7863/v1/models -H "Authorization: Bearer your-api-key"
-
-# 聊天（非流式）
-curl -s http://localhost:7863/v1/chat/completions \
-  -H "Authorization: Bearer your-api-key" \
-  -H "Content-Type: application/json" \
+curl http://localhost:7863/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $API_KEY" \
   -d '{"model":"@makers/deepseek-v4-flash","messages":[{"role":"user","content":"你好"}]}'
-
-# 聊天（流式）
-curl -N http://localhost:7863/v1/chat/completions \
-  -H "Authorization: Bearer your-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"@makers/deepseek-v4-flash","stream":true,"messages":[{"role":"user","content":"数到3"}]}'
-
-# 鉴权可省略（api_key 为空时）；会话池状态
-curl -s http://localhost:7863/pool
 ```
 
-## 配置说明
-
-```json
-{
-  "listen": ":7863",
-  "api_key": "",
-  "models": ["@makers/deepseek-v4-flash", "@makers/deepseek-v4-pro"],
-  "pool_min": 4,
-  "pool_max": 32,
-  "ttl_minutes": 0,
-  "bind_ttl_minutes": 30,
-  "max_req_per_session": 200,
-  "upstream_url": "https://deepseek-harness.edgeone.cool",
-  "agent_preset": "minimal",
-  "model_map": {
-    "@makers/deepseek-v4-flash": {"provider": "edgeone-makers", "model": "@makers/deepseek-v4-flash"}
-  }
-}
-```
-
-| 字段 | 环境变量 | 默认值 | 说明 |
-|---|---|---|---|
-| `listen` | `EDGEONE_API_LISTEN` | `:7863` | 监听地址 |
-| `api_key` | `EDGEONE_API_KEY` | 空 | API 鉴权 key（空=不鉴权） |
-| `models` | `EDGEONE_API_MODELS` | `[flash, pro]` | 支持的模型列表（`/v1/models` 返回） |
-| `pool_min` | `EDGEONE_API_POOL_MIN` | `4` | 会话池最小会话数 |
-| `pool_max` | `EDGEONE_API_POOL_MAX` | `32` | 会话池最大会话数（并发上限） |
-| `ttl_minutes` | `EDGEONE_API_TTL_MINUTES` | `0` | 会话最长生命周期（分钟，`0`=无限制，仅失败或达上限时回收） |
-| `bind_ttl_minutes` | `EDGEONE_API_BIND_TTL_MINUTES` | `30` | 绑定会话（会话连续性）空闲超时（分钟） |
-| `max_req_per_session` | `EDGEONE_API_MAX_REQ_PER_SESSION` | `200` | 单会话最大请求数，超出后自动轮换 |
-| `upstream_url` | `EDGEONE_API_UPSTREAM` | `https://deepseek-harness.edgeone.cool` | 上游 Harness 地址 |
-| `agent_preset` | — | `minimal` | agent 预设（`minimal`/`makers`/`standard`/`code`/`cordis`） |
-
-### 模型与推理强度
-
-`model_map` 将客户端请求的模型名映射到上游 provider/model。客户端可选传 `reasoning_effort`
-（`off`/`high`/`max`），或由映射默认指定。会话级缓存避免重复调用 selectModel。
+### 工具调用
 
 ```bash
-curl -s http://localhost:7863/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"@makers/deepseek-v4-flash","reasoning_effort":"high","messages":[{"role":"user","content":"9.11和9.8哪个大？"}]}'
+curl http://localhost:7863/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $API_KEY" \
+  -d '{
+    "model": "@makers/deepseek-v4-flash",
+    "messages": [{"role":"user","content":"杭州天气怎么样？"}],
+    "tools": [{"type":"function","function":{
+      "name":"get_weather",
+      "description":"查询天气",
+      "parameters":{"type":"object","properties":{"city":{"type":"string"}}}
+    }}]
+  }'
 ```
 
-可用模型目录（`session.models` 实测）：
+返回 `finish_reason="tool_calls"` 与标准 `tool_calls`，由**客户端**执行并把结果以 `role=tool` 消息发回继续对话。网关只做协议翻译，工具永远不在上游执行。
+
+### 多轮上下文
+
+每次请求带 `X-Session-Key: <任意字符串>` 即绑定同一上游会话：
+
+```bash
+curl ... -H 'X-Session-Key: my-session-1' -d '{...}'
+```
+
+同一 key 的后续请求共享上下文；不传则从池中取空闲会话。会话达到 `max_req_per_session` 或连续失败后自动轮换为全新会话。
+
+### 会话池状态
+
+```bash
+curl http://localhost:7863/pool   # free/bound/total、配额轮换计数
+```
+
+## 可用模型
+
+`model_map` 将客户端请求的模型名映射到上游 provider/model，客户端可选传 `reasoning_effort`（`off`/`high`/`max`），或由映射默认指定。
 
 | 模型 | provider | 推理强度 |
 |---|---|---|
@@ -118,77 +134,68 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `@makers/minimax-m3` / `@makers/minimax-m2.7` | edgeone-makers | 无 |
 | `@makers/kimi-k2.6` | edgeone-makers | 无 |
 
-> `deepseek-official` provider 的模型（如 `deepseek-v4-pro`）需要设置 `EDGEONE_API_KEY`
-> （通过 Harness 的 credentials 服务），默认不可用，已从默认 `model_map` 中排除。
+> `deepseek-official` provider 的模型需要额外的上游凭证，默认不可用，已从默认 `model_map` 排除。
 
-## API
+## 工具名过滤（tool filter）
 
-### `POST /v1/chat/completions`
+上游模型可能输出**它自己平台的原生工具名**（Codex/EdgeOne 风格的 `bash`、`str_replace_editor`、`mcp__edgeone__*`），而客户端声明的是 `exec`、`read` 等。网关在返回前做一层过滤：
 
-OpenAI 兼容。支持 `stream`（SSE）、`max_tokens`、`temperature`、`top_p`、`reasoning_effort`、`tools`（见下方「工具调用」）。
+| 类别 | 处理 |
+|---|---|
+| 客户端已声明的名字 | 原样透传 |
+| 别名表命中（如 `bash→exec`、`str_replace_editor→read`） | 改写为目标名（仅当目标名被客户端声明才生效） |
+| `mcp__edgeone__*` / `workspace_run_command` 等平台能力 | 一律丢弃，绝不透传 |
+| 其余未知名 | 丢弃 + 日志 `[TOOLS] filter: drop tool "X"` |
 
-### `GET /v1/models`
+别名表在 `internal/server/toolfilter.go`，加新映射只需补一行。日志里出现 `drop tool` 即提示需要补映射。
 
-返回配置的模型列表。
+## 架构与关键机制
 
-### `GET /pool`
+### 纯文本模式（textOnly）
 
-查看会话池状态（free/bound/total、配额轮换计数）。
+未传 `tools` 时：
 
-### `GET /healthz`
+- 上游 tool-call block 事件在客户端流中**折叠丢弃**（服务端日志 `textOnly: dropping tool-call block`）
+- 工具驱动的轮次**不会终止对话**：`turn/end` 时若本轮只有被丢弃的工具调用，自动续读后续轮次直到模型输出真正正文
+- `finish_reason` 统一归一为 `stop`
 
-健康检查。
+### 工具调用模式
 
-## 会话连续性
+- **原生通道**：上游发 tool-call block（`block-start` → `tool-call-delta` → `block-end`），网关流式拼装为标准 `tool_calls`
+- **文本协议通道**（ToolForge fallback）：模型以纯文本 JSON `{"tool_calls":[...]}` 声明调用时，网关解析并补发结构化 `tool_calls` delta
+- 两通道都经过工具名过滤层
 
-通过 `X-Session-Key` 请求头关联会话：同一 key 的请求复用同一上游会话（保留对话上下文）。
-未提供时自动生成 key。会话达到 `max_req_per_session` 或连续失败后自动轮换为全新会话。
+### 会话生命周期
 
-## 工具调用与工具名翻译
+- 上游约 20 分钟回收空闲会话：`session not found` 被识别为**生命周期事件**（`MarkGone`），换新会话重试，不烧指纹
+- 真实配额错误（`IsQuotaError`）→ `MarkQuotaExceeded` → 该浏览器指纹冷却 24h
+- 绑定会话的 mutex 用 CAS 门控 + `active` 标志，杜绝锁泄漏导致的同 key 请求挂死
 
-网关原生支持 OpenAI `tools` 参数：客户端声明工具后，模型在单回合内返回标准 `tool_calls`
-（流式/非流式一致），客户端执行后把结果以 `role: "tool"` 消息回传即可续接对话。
+## 开发
 
 ```bash
-curl -s http://localhost:7863/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "@makers/deepseek-v4-flash",
-    "messages": [{"role": "user", "content": "读取 /etc/hostname 的内容"}],
-    "tools": [{"type": "function", "function": {"name": "read_file", "description": "读取文件", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}]
-  }'
+go build ./... && go vet ./... && go test ./...
 ```
 
-上游模型倾向输出其**原生工具名**（如 `read`/`bash`/`glob`），而客户端可能声明了不同的名字
-（如 `read_file`/`run_command`/`search_files`）。网关内置**工具名翻译层**，将上游原生名
-按别名映射表重写为客户端实际声明的工具名；已匹配或无法映射的名字原样透传（并输出告警日志）。
-同时系统指令会约束模型「只使用声明列表中的工具名」，从源头降低翻译需求。
+布局：
 
-## 纯文本模式（无 tools 请求）
+```
+cmd/server/           入口：配置、会话池初始化、HTTP 服务
+internal/config/      配置加载与默认值（支持环境变量覆盖）
+internal/auth/        会话池、指纹冷却、生命周期（MarkGone/MarkQuotaExceeded）
+internal/server/      OpenAI 协议层、双模式聚合、工具名过滤（toolfilter.go）
+internal/upstream/    EdgeOne SSE 客户端（block 事件解析、textOnly 折叠续读）
+internal/toolcall/    （保留）
+scripts/              真实场景验证脚本（gen_demo_data / verify_longctx / verify_tools）
+```
 
-未传 `tools` 的请求走**纯文本模式**，完整对齐 [kuku2api](https://github.com/xinxinshuhao-create/kuku2api)
-「把上游 agent 当纯文本黑盒」的思路：
+验证脚本直接请求真实上游（`@makers/deepseek-v4-flash`）：
 
-- 上游回车内出现 `block-start`(tool-call) / `tool-call-delta` / `block-end` 等工具事件时，
-  客户端流直接**折叠丢弃**（服务端日志可见 `textOnly: dropping tool-call block`）
-- 工具驱动的轮次**不会终止对话**——`turn/end` 时若本轮仅发生了被丢弃的工具调用，
-  自动续读后续轮次，直到模型输出真正的正文
-- `finish_reason` 统一归一为 `stop`，绝不输出 `tool_calls`；配合直答指令
-  （"单轮收敛、禁止工具调用"）从源头抑制上游 agent loop
-- 效果：无工具请求永远得到一段完整的纯文本回答，**不会白屏、不会空回复**，
-  与 OpenAI 普通 chat 行为完全一致
-
-这也意味着：客户端声明 `tools` 时获得完整工具调用能力；不声明时获得纯净的对话体验，
-二者互不干扰。
-
-### 会话池扩容
-
-会话池在 `pool_min`（默认 4）~ `pool_max`（默认 32）之间弹性伸缩：
-
-- 空闲时维护协程（15 秒周期）自动回补到 `pool_min`
-- 突发请求超过可用会话时，触发**并发后台预热**（最多 4 个会话创建并行在途），
-  请求以 300ms 轮询等待新会话就绪，而不是串行排队创建
-- 任一指纹（浏览器身份）被上游限流后进入 24h 冷却，不再参与会话创建
+```bash
+python3 scripts/gen_demo_data.py   # 生成演示数据到 /tmp/kuku2api_demo/
+python3 scripts/verify_longctx.py  # 长上下文 + 多轮会话连续性
+python3 scripts/verify_tools.py    # 工具调用矩阵（非流式/流式/多轮链式闭环/名字翻译/纯文本防泄漏）
+```
 
 ## 逆向说明
 
@@ -200,12 +207,9 @@ curl -s http://localhost:7863/v1/chat/completions \
   → dsh-llm-pi-ai → 本地 gateway proxy → AI Gateway（真实 LLM）
 ```
 
-- `session.prompt` 是纯 LLM 端口：`{sessionId, mode: "steer"|"queue", content, clientTimeZone?}`
-  - `steer` = 打断当前轮直接回答（代理默认使用）
-  - `queue` = 追加到队列等待
+- `session.prompt` 是纯 LLM 端口：`{sessionId, mode: "steer"|"queue", content, clientTimeZone?}`；`steer` 打断当前轮直接回答（代理默认），`queue` 追加到队列等待
 - `session.create` 支持 `agentPreset`：`standard`/`code`/`minimal`/`cordis`（内置锁定预设）+ 自定义
-- 前端 bundle（`dsh-client-*`）只是 UI + RPC 转发壳，agent loop 与 LLM 调用全部在服务端 sidecar
-  （`@deepseek-ai/dsh` npm 包的 `lib/bin.js web` 命令）内
+- 前端 bundle 只是 UI + RPC 转发壳，agent loop 与 LLM 调用全部在服务端 sidecar（`@deepseek-ai/dsh` npm 包的 `lib/bin.js web` 命令）内
 
 ## Docker 部署
 
@@ -213,55 +217,14 @@ curl -s http://localhost:7863/v1/chat/completions \
 docker compose up -d --build
 ```
 
-- 端口映射 `7863:7863`，通过 `docker-compose.yml` 的 environment 配置
+- 端口映射与配置通过 `docker-compose.yml` 的 environment 配置
 - Dockerfile 多阶段构建，alpine 运行时无外部依赖
 
-## 目录结构
+## 说明
 
-```
-edgeone2api/
-├── cmd/server/main.go            # 入口：配置、会话池初始化、HTTP 服务
-├── internal/
-│   ├── auth/pool.go              # 会话池：创建/绑定/轮换/并发预热扩容（核心）
-│   ├── auth/pool_test.go         # 会话池单测（含并发扩容回归）
-│   ├── config/config.go          # 配置加载 + model_map + env override
-│   ├── upstream/client.go        # Harness RPC 客户端 + 浏览器指纹 + SSE 读取 + textOnly 折叠
-│   ├── upstream/client_test.go   # textOnly 折叠/续读/归一 + 指令注入单测
-│   ├── upstream/directive.go     # 工具定义注入指令（ToolForge 风格）+ 纯文本直答指令
-│   ├── server/server.go          # OpenAI 兼容 handler + 流式/非流式 + 工具调用 + textOnly 接线
-│   ├── server/tools.go           # 工具名翻译层（上游原生名 → 客户端声明名）
-│   ├── server/tools_test.go      # 翻译层单测
-│   └── toolcall/                 # 可选的工具调用中间件（独立部署）
-├── config.example.json
-├── scripts/                   # 真实场景验证脚本（见下节）
-│   ├── gen_demo_data.py       # 演示数据生成（sales.csv / inventory_notes.txt）
-│   ├── verify_longctx.py      # 长上下文 + 多轮会话连续性验证
-│   └── verify_tools.py        # 复杂工具调用矩阵验证（S1-S6）
-├── Dockerfile
-├── docker-compose.yml
-└── go.mod
-```
-
-## 真实场景验证
-
-验证不依赖 mock——直接请求真实上游 `deepseek-harness.edgeone.cool`，模型为
-`@makers/deepseek-v4-flash`。脚本：
-
-```bash
-python3 scripts/gen_demo_data.py   # 生成演示数据到 /tmp/kuku2api_demo/
-python3 scripts/verify_longctx.py  # 长上下文：6527 字符文档 + 5 轮增量对话（仅发新消息），10/10 通过
-python3 scripts/verify_tools.py    # 工具调用矩阵：S1-S6，18/18 断言通过
-```
-
-`verify_tools.py` 覆盖：非流式/流式、多轮链式工具闭环（read_file → calculate →
-`role:"tool"` 回传续接）、工具名翻译（声明 `read_text`/`run_calc`）、长上下文 + 跨文件推理、
-以及纯文本模式防泄漏（无 tools 请求 `finish_reason=stop`、零 tool_calls 泄漏、正文不白屏）。
+- 上游 `session.create` 偶发超时属上游侧问题（容器启动预热时可见），网关会自动重试
+- 本项目不内置任何模型，纯协议网关；模型能力取决于上游
 
 ## 免责声明
 
-本项目仅供学习和研究使用。请遵守 DeepSeek Harness / EdgeOne Makers 平台服务条款，
-自行承担使用风险。作者不对任何因使用本项目产生的直接或间接损失负责。
-
-## License
-
-MIT
+本项目仅供学习和研究使用。请遵守 DeepSeek Harness / EdgeOne Makers 平台服务条款，自行承担使用风险。
