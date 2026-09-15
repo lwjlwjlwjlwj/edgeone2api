@@ -499,6 +499,14 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 		if streamErr != nil {
 			log.Printf("[STREAM] error: %v", streamErr)
 			success = false
+		} else if isEmptyTurn(sb.String(), result.ToolCalls) {
+			// 上游返回空产出（无文本、无 tool calls、无错误）：session 已死，
+			// 但 StreamEvents 不会报错。判失败让池回收该 session，避免僵尸
+			// session 持续返回空响应（observed: 池里 5 个 free session 全死，
+			// 每个请求都空输出，客户端无限重试）。
+			log.Printf("[STREAM] empty turn: session=%s model=%s — zombie session, marking failed", session.SessionID, model)
+			success = false
+			session.MarkGone()
 		} else {
 			success = true
 			if sessionKey != "" {
@@ -554,6 +562,20 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 		if err != nil {
 			log.Printf("[CHAT] stream error: %v", err)
 		}
+		// 空产出 = 僵尸 session：标记失败并透明重试一次（同 session-not-found 路径）。
+		if err == nil && isEmptyTurn(result.Text, result.ToolCalls) {
+			log.Printf("[CHAT] empty turn: session=%s model=%s — zombie session, reacquiring", session.SessionID, model)
+			session.MarkGone()
+			release(session, false)
+			if attempt == 0 {
+				session, err = reacquire(ctx)
+				if err != nil {
+					writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": map[string]any{"message": "no available session: " + err.Error(), "type": "server_error"}})
+					return
+				}
+				continue
+			}
+		}
 		break
 	}
 	if err != nil {
@@ -563,7 +585,12 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 	}
 
 	success := true
-	if sessionKey != "" {
+	if isEmptyTurn(result.Text, result.ToolCalls) {
+		// 同 streamChat：空产出 = 僵尸 session，判失败让池回收。
+		log.Printf("[CHAT] empty turn: session=%s model=%s — zombie session, marking failed", session.SessionID, model)
+		success = false
+		session.MarkGone()
+	} else if sessionKey != "" {
 		s.pool.AppendHistory(sessionKey, session.SessionID, userText, result.Text)
 	}
 
@@ -752,6 +779,17 @@ func lastUserMessage(msgs []openaiMessage) string {
 		}
 	}
 	return ""
+}
+
+// isEmptyTurn reports whether the upstream produced absolutely nothing
+// (no text, no reasoning, no tool calls) without returning an error. This is
+// the signature of a zombie session: the harness accepted the request but the
+// session is dead server-side, so the SSE stream completes with zero content.
+// StreamEvents does not error in this case, so without this check the session
+// is released as "success" and stays in the pool forever, returning empty to
+// every subsequent request.
+func isEmptyTurn(text string, calls []upstream.AssistantToolCall) bool {
+	return text == "" && len(calls) == 0
 }
 
 // logTools records any tool calls the upstream model actually emitted for a
