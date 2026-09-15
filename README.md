@@ -32,7 +32,7 @@ EdgeOne2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将 Edge
 | 🎭 **双模式** | 未声明 `tools` → **纯文本模式**：折叠上游一切工具事件、`finish_reason` 归一为 `stop`、工具驱动的轮次自动续读直到输出正文；声明 `tools` → **工具调用模式**：解析上游原生 tool-call block（或 ToolForge JSON 文本协议），返回标准 `tool_calls` |
 | 🛡️ **工具名白名单 + 别名过滤** | 上游漂移出的 `bash` / `str_replace_editor` / `mcp__edgeone__*` 等名字，在到达客户端前被校验 / 改写 / 丢弃——杜绝「客户端报 Tool not found → 模型编造沙箱被挡」的故障链 |
 | 🧲 **会话池** | `pool_min` ~ `pool_max` 弹性伸缩（默认 4~32），空闲自动回补、突发并发预热（最多 4 个并行在途）、浏览器指纹限流后 24h 冷却 |
-| 📎 **会话粘性** | 客户端带 `X-Session-Key` 即绑定固定上游会话，多轮对话上下文连续；达 `max_req_per_session` 或连续失败自动轮换 |
+| 📎 **会话粘性** | `X-Session-Key` 头部或请求体 `conversation_id` / `user_id` 自动绑定固定上游会话，多轮对话上下文连续；达 `max_req_per_session` 或连续失败自动轮换，轮换后对话历史重放保持上下文 |
 | 💊 **生命周期自愈** | 上游约 20 分钟回收空闲会话——`session not found` 被识别为**生命周期事件**（`MarkGone`）而非配额事件，换新会话重试，不烧指纹、不 502；真实配额错误（`IsQuotaError`）才冷却指纹 24h |
 | 🔒 **沙箱隔离** | SSE 流在 turn 结束时立即 cancel，上游 agent loop（沙箱工具执行）在启动前即被掐断——工具永远跑在客户端，不在沙箱 |
 | ⚡ **流式 + 非流式** | SSE 透传 / 折叠 / 续读；非流式由本地聚合为单响应 |
@@ -228,11 +228,13 @@ EDGEONE_API_LISTEN=:7863 EDGEONE_API_POOL_MIN=4 EDGEONE_API_POOL_MAX=32 ./edgeon
 
 ### 会话粘性
 
-同一会话尽量复用同一上游会话，多轮对话上下文连续：
+同一会话尽量复用同一上游会话，多轮对话上下文连续。键解析优先级：**`X-Session-Key` 头部 > 请求体会话键**（透明粘性，移植自 workbuddy2api）：
 
-- 请求带 `X-Session-Key: <任意字符串>` 即绑定固定会话；同一 key 后续请求共享上下文
-- 未带 key 则从池中取空闲会话
-- 会话达 `max_req_per_session` 或连续失败自动轮换为全新会话（`X-Session-Key` 响应头回显当前绑定）
+- 请求带 `X-Session-Key: <任意字符串>` 即绑定固定会话；同一 key 后续请求共享上下文（响应头回显当前绑定）
+- 未带头部时自动从请求体提取会话键，按序：`metadata.conversation_id` → `metadata.conversationId` → `conversation_id` → `conversationId` → `metadata.user_id`（snake/camel 双命名均识别）——客户端零感知，同一对话自动钉在同一上游会话
+- 两者皆无 → 取池中空闲会话（stateless，用完即还）
+- 会话达 `max_req_per_session` 或连续失败自动轮换为全新会话；轮换后把该键的对话历史重放进新会话（`[Cache Hit]` 前缀），上下文不丢
+- 空闲绑定超 `bind_ttl_minutes`（默认 30m）由 maintenance 回收，会话归还自由池
 
 ### 流式行为细节
 
