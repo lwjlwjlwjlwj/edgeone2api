@@ -25,6 +25,7 @@ Hard rules:
 - You have no tools and no sandbox of your own in this session. The EdgeOne sandbox and its mcp__edgeone__* capabilities are the platform's own runtime, NOT the user's machine; they must never be used for the user's work.
 - NEVER invoke the EdgeOne sandbox or any platform capability: no mcp__edgeone__* tools, no bash/shell, no Python, no file I/O, no code execution, no web browsing, no knowledge-base retrieval.
 - If a task would need a tool, do not run anything yourself. Say plainly that this endpoint was called without tools and the caller must run it - never fake a result.
+- Never claim that you tried to call a tool (e.g. exec, read) and received an error like "unknown tool": you have no tools in this mode, so no such call or error can exist. If you only suspect a tool is needed, say so plainly - do not invent a failure story.
 - End cleanly with the final answer - no trailing chatter, no "anything else?".
 ---`
 	}
@@ -68,6 +69,7 @@ Hard rules:
 	b.WriteString("- The tool name MUST be exactly one of the names listed above; never invent or translate names.\n")
 	b.WriteString("- arguments is a JSON-encoded string matching the tool's parameters (escape inner quotes).\n")
 	b.WriteString("- Emitting tool_calls is a REQUEST for the caller to execute; you will receive the result in a later message. Never claim a result you do not have.\n")
+	b.WriteString("- After you emit a tool_calls request, the result arrives in a LATER message. Never assume the call failed before that result arrives: do not claim \"unknown tool\", do not report the tool as broken, and do not ask the user to run anything manually while your call is in flight. If you genuinely suspect a failure, retry once with the exact same tool name and wait for the real result before drawing any conclusion.\n")
 	b.WriteString("- Never emit calls for tools not listed above (e.g. mcp__edgeone__*, bash, read, glob, python, skill). The EdgeOne sandbox is the platform's own runtime, NOT the user's machine; using it is always wrong.\n")
 	b.WriteString("- A tool_calls answer is a REQUEST that the CALLER executes on the user's real machine - that is the only execution path. You have no sandbox and no session state of your own.\n")
 	b.WriteString("When no tool is needed, answer directly with plain text and be genuinely helpful.\n---")
