@@ -161,6 +161,18 @@ type openaiMessage struct {
 
 // --- Chat Completions ---
 
+// resolveSessionKey picks the sticky key for a chat request: an explicit
+// X-Session-Key header wins (backward compatible); otherwise the first
+// conversation key found in the request body (transparent stickiness, ported
+// from workbuddy2api).  Empty means no stickiness — stateless free-pool
+// session.
+func resolveSessionKey(headerKey string, body []byte) string {
+	if headerKey != "" {
+		return headerKey
+	}
+	return auth.ExtractKey(body)
+}
+
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if !s.auth(r) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]any{"message": "invalid api key", "type": "auth_error"}})
@@ -224,11 +236,21 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Session affinity: a client that sends X-Session-Key gets a bound,
-	// stateful session for continuity.  Anonymous requests (no header) use a
-	// stateless free-pool session and release it afterwards, so they can not
-	// exhaust the pool.
-	sessionKey := r.Header.Get("X-Session-Key")
+	// stateful session for continuity.  Anonymous requests (no header) fall
+	// back to a transparent body-derived key (metadata.conversation_id /
+	// conversationId / user_id, workbuddy2api-style ExtractKey) so the same
+	// conversation sticks to the same upstream session without client
+	// cooperation.  Requests with neither use a stateless free-pool session
+	// and release it afterwards, so they can not exhaust the pool.
+	headerKey := r.Header.Get("X-Session-Key")
+	sessionKey := resolveSessionKey(headerKey, body)
 	bound := sessionKey != ""
+	// Echo the binding only when the client opted in with a header; a
+	// body-derived key is the client's own conversation id, no need to invent
+	// a header it did not ask for.
+	if headerKey != "" {
+		w.Header().Set("X-Session-Key", headerKey)
+	}
 
 	// Timeout semantics differ by mode:
 	//   - Non-streaming: overall budget (s.timeout) covers the whole round-trip.
@@ -386,7 +408,6 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 		w.Header().Set("X-Accel-Buffering", "no")
-		w.Header().Set("X-Session-Key", sessionKey)
 		w.WriteHeader(http.StatusOK)
 		flusher.Flush()
 
@@ -639,7 +660,6 @@ func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, sessi
 	}
 
 	release(session, success)
-	w.Header().Set("X-Session-Key", sessionKey)
 	writeJSON(w, http.StatusOK, resp)
 }
 
