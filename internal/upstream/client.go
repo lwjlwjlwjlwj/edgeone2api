@@ -187,10 +187,19 @@ func (c *Client) FingerprintSignature() string {
 // agentPreset optionally specifies the agent preset ("makers", "minimal", etc.).
 // If empty, the server-side default ("makers") is used.
 func (c *Client) CreateSession(ctx context.Context, agentPreset string) (convID, sessionID string, err error) {
+	return c.CreateSessionOpts(ctx, agentPreset, nil)
+}
+
+// CreateSessionOpts is CreateSession with extra session.create payload fields
+// (used to probe harness knobs such as disabling tool injection).
+func (c *Client) CreateSessionOpts(ctx context.Context, agentPreset string, extra map[string]any) (convID, sessionID string, err error) {
 	convID = randHex(32)
 	payload := map[string]interface{}{}
 	if agentPreset != "" {
 		payload["agentPreset"] = agentPreset
+	}
+	for k, v := range extra {
+		payload[k] = v
 	}
 	rpcReq := RPCRequest{
 		Type:    "client-request",
