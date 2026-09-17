@@ -156,24 +156,38 @@ type Client struct {
 
 // NewClient creates a new upstream client with a random browser fingerprint.
 // baseURL is the web chat origin, e.g. https://deepseek-harness.edgeone.cool
+// headerTimeoutRPC bounds control-plane RPCs (session.create / selectModel /
+// prompt). These are normally fast but queue on an overloaded harness; 60s is
+// generous yet still bounded.
+const headerTimeoutRPC = 60 * time.Second
+
+// headerTimeoutSSE bounds the events.mux handshake only. The harness holds the
+// connection until the session backend is ready, which under load takes well
+// past 30s; 90s gives it room without hanging forever. Once headers arrive the
+// stream has no deadline (see StreamEvents idleTimeout).
+const headerTimeoutSSE = 90 * time.Second
+
+func newTransport(headerTimeout time.Duration) *http.Transport {
+	return &http.Transport{
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: headerTimeout,
+		Proxy:                 http.ProxyFromEnvironment,
+	}
+}
+
 func NewClient(baseURL string) *Client {
 	if baseURL == "" {
 		baseURL = "https://deepseek-harness.edgeone.cool"
 	}
 	baseURL = strings.TrimSuffix(baseURL, "/")
-	transport := &http.Transport{
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   20,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   15 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second, // connect (SSE events.mux / RPC) must respond within 30s
-		Proxy:                 http.ProxyFromEnvironment,
-	}
 	return &Client{
 		baseURL: baseURL,
 		fp:      randomFingerprint(),
-		hc:      &http.Client{Timeout: 120 * time.Second, Transport: transport},
-		sseHC:   &http.Client{Transport: transport}, // SSE stream: no overall timeout (active output must never be cut off)
+		hc:      &http.Client{Timeout: 120 * time.Second, Transport: newTransport(headerTimeoutRPC)},
+		sseHC:   &http.Client{Transport: newTransport(headerTimeoutSSE)}, // SSE stream: no overall timeout (active output must never be cut off)
 	}
 }
 
