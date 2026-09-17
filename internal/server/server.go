@@ -375,6 +375,9 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 	userText := lastUserMessage(msgs)
 
 	// Try once with the current session; if quota error, retry with a fresh one.
+	// lastErr carries the final StartChat failure so the fallback 502 below
+	// reports the real cause (a zombie session is *not* a quota event).
+	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		items := s.buildItems(session, sessionKey, msgs, toolsJSON)
 		cs, err := session.Client.StartChat(ctx, session.SessionID, session.ConversationID, items)
@@ -398,7 +401,9 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 				}
 				continue // retry
 			}
+			lastErr = err
 			release(session, false)
+			log.Printf("[CHAT] start chat failed: %v", err)
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": "upstream error: " + err.Error(), "type": "upstream_error"}})
 			return
 		}
@@ -539,9 +544,17 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, session 
 		flusher.Flush()
 		return
 	}
-	// Both attempts failed
+	// Both attempts failed with quota/session-gone errors: report the real
+	// cause instead of a blanket "quota exceeded". A recycled zombie session is
+	// upstream lifecycle, not a quota event, and the old wording sent people
+	// hunting in the wrong direction.
 	release(session, false)
-	writeJSON(w, http.StatusBadGateway, map[string]any{"error": "upstream quota exceeded, retry later"})
+	log.Printf("[CHAT] both attempts failed: %v", lastErr)
+	if upstream.IsQuotaError(lastErr) {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": "upstream quota exceeded, retry later: " + lastErr.Error(), "type": "upstream_error"}})
+	} else {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": "upstream session unavailable after rotation: " + lastErr.Error(), "type": "upstream_error"}})
+	}
 }
 
 func (s *Server) nonStreamChat(w http.ResponseWriter, ctx context.Context, session *auth.Session, chatID, model string, created int64, msgs []openaiMessage, sessionKey string, release func(*auth.Session, bool), reacquire func(context.Context) (*auth.Session, error), toolsJSON string, textOnly bool, filter *toolFilter) {
